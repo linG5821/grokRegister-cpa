@@ -60,7 +60,7 @@ cp config.example.json config.json
 | --- | --- |
 | `cpa_auto_add` | 是否开启 CPA 自动入库 |
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
-| `cpa_remote_url` | 远程 CPA 地址，如 `http://127.0.0.1:8317` |
+| `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
 | `email_provider` | `duckmail` / `yyds` / `cloudflare` |
 | `register_count` | 目标注册数量 |
@@ -130,12 +130,11 @@ SSO 不是 CPA 凭据。程序会：
 ```json
 {
   "cpa_auto_add": true,
-  "cpa_auth_dir": "/path/to/CLIProxyAPI/auths"
+  "cpa_auth_dir": "你的CPA auth目录"
 }
 ```
 
-跨机器 / WSL 可写挂载路径，例如  
-`//wsl.localhost/Ubuntu/home/you/CLIProxyAPI/auths`。
+`cpa_auth_dir` 填 CPA 实际监听的 auth 目录路径即可。
 
 ### 远程 Management API
 
@@ -143,7 +142,7 @@ SSO 不是 CPA 凭据。程序会：
 {
   "cpa_auto_add": true,
   "cpa_auth_dir": "",
-  "cpa_remote_url": "http://127.0.0.1:8317",
+  "cpa_remote_url": "http://你的CPA地址:8317",
   "cpa_management_key": "你的管理密钥明文"
 }
 ```
@@ -162,7 +161,7 @@ python sso_to_auth_json.py --sso sso_list.txt --cpa-auth-dir /path/to/auths
 
 # 上传远程 CPA
 python sso_to_auth_json.py --sso sso_list.txt \
-  --cpa-remote-url http://127.0.0.1:8317 \
+  --cpa-remote-url http://你的CPA地址:8317 \
   --cpa-management-key '你的管理密钥'
 
 # 单个 cookie + 代理
@@ -219,7 +218,7 @@ python grok_register_ttk.py
 
 ```bash
 curl -H "Authorization: Bearer <管理密钥>" \
-  http://127.0.0.1:8317/v0/management/auth-files
+  http://你的CPA地址:8317/v0/management/auth-files
 ```
 
 **CLI 为什么还开浏览器**  

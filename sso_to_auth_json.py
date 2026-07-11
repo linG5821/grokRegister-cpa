@@ -437,12 +437,12 @@ def main() -> int:
     ap.add_argument(
         "--cpa-auth-dir",
         default=None,
-        help="额外写出 CLIProxyAPI 扁平格式 xai-<email>.json 到该目录（CPA 热加载，可直接指向 CPA 挂载目录）",
+        help="额外写出 CLIProxyAPI 扁平格式 xai-<email>.json 到该目录（CPA 热加载）",
     )
     ap.add_argument(
         "--cpa-remote-url",
         default=None,
-        help="远程 CPA 地址，如 http://IP:8317；配合 --cpa-management-key 通过 Management API 上传",
+        help="远程 CPA 地址，如 http://你的CPA地址:8317；配合 --cpa-management-key 通过 Management API 上传",
     )
     ap.add_argument(
         "--cpa-management-key",
