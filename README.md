@@ -33,7 +33,7 @@
 - 注册成功后自动入库 CPA（本地目录 / 远程 Management API，可同时开）
 - GUI + CLI 两种运行方式（CLI 仍会打开浏览器完成注册页）
 - Chromium/Chrome 自动处理 Turnstile
-- DuckMail / YYDS / Cloudflare 临时邮箱
+- DuckMail / YYDS / Cloudflare / MailNest（Outlook）临时邮箱
 - 注册后可选开启 NSFW
 - 页面卡住重试、验证码失败换邮箱、浏览器重启与内存清理
 - CLI：一次 `Ctrl+C` 安全停止，清理阶段不刷 traceback；再按一次强制中断
@@ -69,7 +69,9 @@ cp config.example.json config.json
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` |
+| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `mailnest` |
+| `mailnest_api_key` | MailNest（迈巢 Outlook）API Key |
+| `mailnest_project_code` | MailNest 项目代码，默认 `x-ai001` |
 | `register_count` | 目标注册数量 |
 | `proxy` | 代理；换 token 的 OAuth 请求也走此代理 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
@@ -122,6 +124,21 @@ Worker 若配置了全局 `PASSWORDS`，再加：
 ```json
 { "cloudflare_custom_auth": "你的全局访问密码" }
 ```
+
+### MailNest（Outlook 临时邮箱）
+
+[迈巢 MailNest](https://mailnest.top/) 采用项目制。配置 API Key 与项目代码（默认 `x-ai001`）：
+
+```json
+{
+  "email_provider": "mailnest",
+  "mailnest_api_key": "你的 API Key",
+  "mailnest_project_code": "x-ai001"
+}
+```
+
+- API Key：https://mailnest.top/account  
+- 项目代码：https://mailnest.top/buy-email（默认可直接用 `x-ai001`）
 
 ## CPA 自动入库
 

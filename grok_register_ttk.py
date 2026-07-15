@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
+    "mailnest_api_key": "",
+    "mailnest_project_code": "x-ai001",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -275,6 +277,99 @@ def cloudflare_create_temp_address(api_base):
     if not address or not jwt:
         raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
     return address, jwt
+
+
+MAILNEST_API_BASE = "https://mailnest.top"
+MAILNEST_DEFAULT_PROJECT_CODE = "x-ai001"
+
+
+def get_mailnest_api_key():
+    key = str(config.get("mailnest_api_key", "") or "").strip()
+    if not key:
+        raise Exception(f"请在配置文件中配置 mailnest_api_key | 注册网址：{MAILNEST_API_BASE}")
+    return key
+
+
+def get_mailnest_project_code():
+    code = str(config.get("mailnest_project_code", "") or "").strip()
+    return code or MAILNEST_DEFAULT_PROJECT_CODE
+
+
+def mailnest_buy_email():
+    resp = http_post(
+        f"{MAILNEST_API_BASE}/api/v1/email/temporary/buy",
+        headers={"Authorization": f"Bearer {get_mailnest_api_key()}"},
+        json={
+            "project_code": get_mailnest_project_code(),
+            "count": 1,
+        },
+        timeout=30,
+    )
+    try:
+        resp_json = resp.json()
+    except Exception as exc:
+        raise Exception(f"MailNest 买号响应无效: {exc}; body={resp.text[:300]}") from exc
+    if str(resp_json.get("code")) != "00000":
+        raise Exception(f"MailNest 买号失败: {resp.text[:500]}")
+    data = resp_json.get("data") or []
+    if not data or not data[0].get("email"):
+        raise Exception(f"MailNest 买号无邮箱: {resp.text[:500]}")
+    return data[0]["email"]
+
+
+def mailnest_receive_email(email):
+    resp = http_post(
+        f"{MAILNEST_API_BASE}/api/v1/email/receive",
+        headers={"Authorization": f"Bearer {get_mailnest_api_key()}"},
+        json={"email": email},
+        timeout=30,
+    )
+    try:
+        resp_json = resp.json()
+    except Exception as exc:
+        raise Exception(f"MailNest 收信响应无效: {exc}; body={resp.text[:300]}") from exc
+    if str(resp_json.get("code")) != "00000":
+        raise Exception(f"MailNest 收信失败: {resp.text[:500]}")
+    return resp_json.get("data") or []
+
+
+def mailnest_get_code(
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+):
+    deadline = time.time() + timeout
+    seen = set()
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        try:
+            mails = mailnest_receive_email(email)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] MailNest 拉取邮件失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        for mail in mails or []:
+            if not isinstance(mail, dict):
+                continue
+            mail_id = str(mail.get("id") or mail.get("message_id") or "")
+            preview = str(mail.get("body_preview") or mail.get("text") or mail.get("body") or "")
+            subject = str(mail.get("subject") or "")
+            fingerprint = mail_id or f"{subject}|{preview[:80]}"
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            if log_callback:
+                log_callback(f"[Debug] MailNest 收到邮件: {subject or fingerprint}")
+            code = extract_verification_code(f"{subject}\n{preview}", subject)
+            if code:
+                if log_callback:
+                    log_callback(f"[*] MailNest 从邮件中提取到验证码: {code}")
+                return code
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise Exception(f"MailNest 在 {timeout}s 内未收到验证码邮件")
 
 
 def get_user_agent():
@@ -809,6 +904,8 @@ def get_email_and_token(api_key=None):
             if not token:
                 raise Exception("获取 Cloudflare 邮箱 token 失败")
             return address, token
+    if provider == "mailnest":
+        return mailnest_buy_email(), "_"
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -850,6 +947,14 @@ def get_oai_code(
             log_callback=log_callback,
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
+        )
+    if provider == "mailnest":
+        return mailnest_get_code(
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
         )
     return duckmail_get_oai_code(
         dev_token,
@@ -2609,7 +2714,12 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_combo = tk_option_menu(
+            config_frame,
+            self.email_provider_var,
+            ["duckmail", "yyds", "cloudflare", "mailnest"],
+            width=12,
+        )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -2686,25 +2796,37 @@ class GrokRegisterGUI:
         self.cloudflare_custom_auth_entry = tk_entry(config_frame, textvariable=self.cloudflare_custom_auth_var, width=34)
         add_field(self.cloudflare_custom_auth_entry, 5, 3)
 
-        add_label(6, 0, "CPA 直出(SSO→auth):")
+        add_label(6, 0, "MailNest API Key:")
+        self.mailnest_api_key_var = tk.StringVar(value=str(config.get("mailnest_api_key", "")))
+        self.mailnest_api_key_entry = tk_entry(config_frame, textvariable=self.mailnest_api_key_var, width=34)
+        add_field(self.mailnest_api_key_entry, 6, 1)
+
+        add_label(6, 2, "MailNest 项目代码:")
+        self.mailnest_project_code_var = tk.StringVar(
+            value=str(config.get("mailnest_project_code", MAILNEST_DEFAULT_PROJECT_CODE) or MAILNEST_DEFAULT_PROJECT_CODE)
+        )
+        self.mailnest_project_code_entry = tk_entry(config_frame, textvariable=self.mailnest_project_code_var, width=34)
+        add_field(self.mailnest_project_code_entry, 6, 3)
+
+        add_label(7, 0, "CPA 直出(SSO→auth):")
         self.cpa_auto_add_var = tk.BooleanVar(value=bool(config.get("cpa_auto_add", False)))
         self.cpa_auto_add_check = tk_checkbutton(config_frame, variable=self.cpa_auto_add_var)
-        add_field(self.cpa_auto_add_check, 6, 1, sticky=tk.W)
+        add_field(self.cpa_auto_add_check, 7, 1, sticky=tk.W)
 
-        add_label(7, 0, "CPA auth 目录:")
+        add_label(8, 0, "CPA auth 目录:")
         self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "")))
         self.cpa_auth_dir_entry = tk_entry(config_frame, textvariable=self.cpa_auth_dir_var, width=72)
-        add_field(self.cpa_auth_dir_entry, 7, 1, columnspan=3)
+        add_field(self.cpa_auth_dir_entry, 8, 1, columnspan=3)
 
-        add_label(8, 0, "CPA 远程地址:")
+        add_label(9, 0, "CPA 远程地址:")
         self.cpa_remote_url_var = tk.StringVar(value=str(config.get("cpa_remote_url", "")))
         self.cpa_remote_url_entry = tk_entry(config_frame, textvariable=self.cpa_remote_url_var, width=40)
-        add_field(self.cpa_remote_url_entry, 8, 1)
+        add_field(self.cpa_remote_url_entry, 9, 1)
 
-        add_label(8, 2, "CPA 管理密钥:")
+        add_label(9, 2, "CPA 管理密钥:")
         self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
         self.cpa_management_key_entry = tk_entry(config_frame, textvariable=self.cpa_management_key_var, width=28)
-        add_field(self.cpa_management_key_entry, 8, 3)
+        add_field(self.cpa_management_key_entry, 9, 3)
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -2791,6 +2913,10 @@ class GrokRegisterGUI:
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
         config["defaultDomains"] = self.default_domains_var.get().strip()
         config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
+        config["mailnest_api_key"] = self.mailnest_api_key_var.get().strip()
+        config["mailnest_project_code"] = (
+            self.mailnest_project_code_var.get().strip() or MAILNEST_DEFAULT_PROJECT_CODE
+        )
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
@@ -2804,6 +2930,9 @@ class GrokRegisterGUI:
         save_config()
         if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
+            return
+        if config["email_provider"] == "mailnest" and not config["mailnest_api_key"]:
+            self.log("[!] MailNest 模式需要先填写 MailNest API Key")
             return
         try:
             count = int(self.count_var.get())
