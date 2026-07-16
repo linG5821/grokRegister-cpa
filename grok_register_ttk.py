@@ -75,8 +75,49 @@ from register_flow import (
 
 
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
+
+_session_log_path = None
+_session_log_lock = threading.Lock()
+
+
+def initialize_session_log(log_dir=None, now=None):
+    """为本次程序启动创建一个独立的 UTF-8 日志文件。"""
+    global _session_log_path
+    with _session_log_lock:
+        if _session_log_path:
+            return _session_log_path
+
+        target_dir = log_dir or os.path.join(APP_DIR, "log")
+        os.makedirs(target_dir, exist_ok=True)
+        timestamp = (now or datetime.datetime.now()).strftime("%Y%m%d_%H%M%S")
+        suffix = 1
+        while True:
+            suffix_text = "" if suffix == 1 else f"_{suffix}"
+            path = os.path.join(target_dir, f"app_{timestamp}{suffix_text}.log")
+            try:
+                with open(path, "x", encoding="utf-8", newline="\n"):
+                    pass
+            except FileExistsError:
+                suffix += 1
+                continue
+            _session_log_path = path
+            return path
+
+
+def append_session_log(line):
+    path = _session_log_path
+    if not path:
+        return
+    try:
+        with _session_log_lock:
+            with open(path, "a", encoding="utf-8", newline="\n") as log_file:
+                log_file.write(f"{line}\n")
+    except OSError:
+        # 持久化日志失败不应中断正在进行的注册任务。
+        pass
 
 UI_BG = "#242424"
 UI_PANEL_BG = "#2b2b2b"
@@ -1988,6 +2029,7 @@ class GrokRegisterGUI:
             return
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
+        append_session_log(line)
         print(line, flush=True)
         self.log_text.insert(tk.END, f"{line}\n")
         self.log_text.see(tk.END)
@@ -2478,7 +2520,9 @@ def cli_log(message):
     if not should_emit_log(message):
         return
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {message}", flush=True)
+    line = f"[{timestamp}] {message}"
+    append_session_log(line)
+    print(line, flush=True)
 
 
 def run_registration_cli(count):
@@ -2871,6 +2915,10 @@ def main_cli():
 
 
 def main():
+    try:
+        initialize_session_log()
+    except OSError as exc:
+        print(f"[日志] 无法创建日志文件: {exc}", flush=True)
     load_config()
     _wire_runtime_modules()
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
