@@ -143,6 +143,8 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
+    # 开启后创建 user@随机子域.主域（需 Worker RANDOM_SUBDOMAIN_DOMAINS 包含该主域）
+    "cloudflare_random_subdomain": False,
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "close_browser_on_stop": False,
@@ -383,6 +385,10 @@ def _pick_list_payload(data):
     return _pick_list(data)
 
 
+def cloudflare_random_subdomain_enabled():
+    return bool(config.get("cloudflare_random_subdomain", False))
+
+
 def cloudflare_create_temp_address(api_base):
     return cloudflare_provider.create_temp_address(
         http_post,
@@ -393,6 +399,7 @@ def cloudflare_create_temp_address(api_base):
         auth_mode=get_cloudflare_auth_mode(),
         custom_auth=get_cloudflare_custom_auth(),
         name=generate_username(10),
+        enable_random_subdomain=cloudflare_random_subdomain_enabled(),
     )
 
 
@@ -1813,6 +1820,9 @@ class GrokRegisterGUI:
         )
         self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
         self.cloudflare_custom_auth_var = tk.StringVar(value=str(config.get("cloudflare_custom_auth", "")))
+        self.cloudflare_random_subdomain_var = tk.BooleanVar(
+            value=bool(config.get("cloudflare_random_subdomain", False))
+        )
         self._cloudflare_widgets = [
             p_label(0, 0, "API Base:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_api_base_var, width=52), 0, 1, columnspan=3),
@@ -1836,6 +1846,17 @@ class GrokRegisterGUI:
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_custom_auth_var, width=34), 2, 3),
             p_label(3, 0, "CF 路径（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_paths_var, width=52), 3, 1, columnspan=3),
+            p_field(
+                tk_checkbutton(
+                    self.provider_frame,
+                    text="随机三级域名（user@子域.主域，需 Worker 开启 RANDOM_SUBDOMAIN）",
+                    variable=self.cloudflare_random_subdomain_var,
+                ),
+                4,
+                0,
+                columnspan=4,
+                sticky=tk.W,
+            ),
         ]
 
         # YYDS
@@ -2136,6 +2157,7 @@ class GrokRegisterGUI:
             config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
             config["defaultDomains"] = self.default_domains_var.get().strip()
             config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
+            config["cloudflare_random_subdomain"] = bool(self.cloudflare_random_subdomain_var.get())
             config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
             config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
             config["mailnest_api_key"] = self.mailnest_api_key_var.get().strip()
@@ -2316,6 +2338,7 @@ class GrokRegisterGUI:
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
         config["defaultDomains"] = self.default_domains_var.get().strip()
         config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
+        config["cloudflare_random_subdomain"] = bool(self.cloudflare_random_subdomain_var.get())
         config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
         config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
         config["mailnest_api_key"] = self.mailnest_api_key_var.get().strip()

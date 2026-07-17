@@ -12,6 +12,7 @@
   "cloudflare_path_accounts": "/api/new_address",
   "cloudflare_path_token": "/api/token",
   "cloudflare_path_messages": "/api/mails",
+  "cloudflare_random_subdomain": false,
   "proxy": "",
   "enable_nsfw": true,
   "close_browser_on_stop": false,

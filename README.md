@@ -104,6 +104,7 @@ cp config.example.json config.json
 | `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key` |
 | `cloudflare_custom_auth` | Worker 全局密码（`PASSWORDS`），注入 `x-custom-auth` |
 | `cloudflare_path_*` | domains / accounts / token / messages 路径 |
+| `cloudflare_random_subdomain` | 是否创建 `user@随机子域.主域`（需 Worker `RANDOM_SUBDOMAIN_DOMAINS` 包含该主域） |
 | `defaultDomains` | Cloudflare / CloudMail 默认收信域名，多个用逗号分隔 |
 
 ### Cloudflare 邮箱（默认匿名）
