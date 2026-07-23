@@ -610,7 +610,7 @@ def _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=None, log_callback=None)
         maybe_import_web_sso(config, sso, log=log_callback)
     except Exception as exc:
         if log_callback:
-            log_callback(f"[Debug] chenyme/g2a 后处理异常: {exc}")
+            log_callback(f"[!] chenyme/g2a 后处理异常: {exc}")
 
 
 def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> bool:

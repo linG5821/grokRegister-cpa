@@ -105,6 +105,21 @@ def _normalize_sso(raw: str) -> str:
     return sso
 
 
+def _resp_preview(resp: Any, limit: int = 240) -> str:
+    try:
+        text = getattr(resp, "text", "") or ""
+        return str(text).replace("\n", " ")[:limit]
+    except Exception:
+        return ""
+
+
+def _http_error(resp: Any, what: str) -> RuntimeError:
+    code = getattr(resp, "status_code", "?")
+    if int(code or 0) == 401:
+        return RuntimeError("chenyme unauthorized")
+    return RuntimeError(f"{what} HTTP {code}: {_resp_preview(resp)}")
+
+
 def import_web_sso(
     base: str,
     admin_token: str,
@@ -115,26 +130,34 @@ def import_web_sso(
     root = normalize_base(base)
     sso = _normalize_sso(sso_token)
     if not root or not admin_token or not sso:
-        return False
+        raise RuntimeError("web/import 参数不完整")
     endpoint = f"{root}/api/admin/v1/accounts/web/import"
     content = (sso + "\n").encode("utf-8")
-    files = {
-        "files": ("grok-web-sso-tokens.txt", io.BytesIO(content), "text/plain"),
-    }
-    resp = requests.post(
-        endpoint,
-        headers={"Authorization": f"Bearer {admin_token}"},
-        files=files,
-        timeout=60,
-        proxies={},
-    )
-    if resp.status_code == 401:
-        raise RuntimeError("chenyme unauthorized")
-    resp.raise_for_status()
-    # 消费 SSE/body
-    _ = getattr(resp, "text", "") or ""
-    _log(log, "[chenyme] web/import SSO 完成")
-    return True
+    # chenyme 管理端常见字段名为 files；失败时再试 file
+    last_err: Optional[BaseException] = None
+    for field in ("files", "file"):
+        files = {
+            field: ("grok-web-sso-tokens.txt", io.BytesIO(content), "text/plain"),
+        }
+        resp = requests.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {admin_token}"},
+            files=files,
+            timeout=60,
+            proxies={},
+        )
+        code = int(getattr(resp, "status_code", 0) or 0)
+        if code == 401:
+            raise RuntimeError("chenyme unauthorized")
+        if 200 <= code < 300:
+            _ = getattr(resp, "text", "") or ""
+            _log(log, f"[chenyme] web/import SSO 完成 (field={field})")
+            return True
+        last_err = _http_error(resp, f"web/import field={field}")
+        if code in (400, 404, 415, 422):
+            continue
+        break
+    raise last_err or RuntimeError("web/import 失败")
 
 
 def import_build_account(
@@ -146,27 +169,36 @@ def import_build_account(
     """POST /api/admin/v1/accounts/import — multipart 字段 file，单号 accounts JSON。"""
     root = normalize_base(base)
     if not root or not admin_token or not entry:
-        return False
+        raise RuntimeError("accounts/import 参数不完整")
     endpoint = f"{root}/api/admin/v1/accounts/import"
     payload = single_account_payload(entry)
     raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-    files = {
-        "file": ("grok-build-account.json", io.BytesIO(raw), "application/json"),
-    }
-    resp = requests.post(
-        endpoint,
-        headers={"Authorization": f"Bearer {admin_token}"},
-        files=files,
-        timeout=120,
-        proxies={},
-    )
-    if resp.status_code == 401:
-        raise RuntimeError("chenyme unauthorized")
-    resp.raise_for_status()
-    _ = getattr(resp, "text", "") or ""
     email = str(entry.get("email") or entry.get("name") or "")
-    _log(log, f"[chenyme] accounts/import Build 完成 ({email})")
-    return True
+    last_err: Optional[BaseException] = None
+    # 用户实测字段名为 file；兼容 files
+    for field in ("file", "files"):
+        files = {
+            field: ("grok-build-account.json", io.BytesIO(raw), "application/json"),
+        }
+        resp = requests.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {admin_token}"},
+            files=files,
+            timeout=120,
+            proxies={},
+        )
+        code = int(getattr(resp, "status_code", 0) or 0)
+        if code == 401:
+            raise RuntimeError("chenyme unauthorized")
+        if 200 <= code < 300:
+            preview = _resp_preview(resp, 120)
+            _log(log, f"[chenyme] accounts/import Build 完成 ({email}) field={field} {preview}")
+            return True
+        last_err = _http_error(resp, f"accounts/import field={field}")
+        if code in (400, 404, 415, 422):
+            continue
+        break
+    raise last_err or RuntimeError("accounts/import 失败")
 
 
 def maybe_import_web_sso(config: dict, sso: str, log: LogFn = None) -> None:
@@ -176,10 +208,11 @@ def maybe_import_web_sso(config: dict, sso: str, log: LogFn = None) -> None:
     user = str(config.get("chenyme_grok2api_username", "") or "").strip()
     password = str(config.get("chenyme_grok2api_password", "") or "").strip()
     if not base or not user or not password:
-        _log(log, "[Debug] chenyme 未配置 base/账号，跳过 SSO 导入")
+        _log(log, "[!] chenyme SSO 导入已开但未配置 base/账号，跳过")
         return
     sso_n = _normalize_sso(sso)
     if not sso_n:
+        _log(log, "[!] chenyme web/import 跳过：SSO 为空")
         return
     try:
         for attempt in range(2):
@@ -193,7 +226,7 @@ def maybe_import_web_sso(config: dict, sso: str, log: LogFn = None) -> None:
                     continue
                 raise
     except Exception as exc:
-        _log(log, f"[Debug] chenyme web/import 失败: {exc}")
+        _log(log, f"[!] chenyme web/import 失败: {exc}")
 
 
 def maybe_export_build_after_cpa(
@@ -207,10 +240,10 @@ def maybe_export_build_after_cpa(
     try:
         entry = build_import_entry(cpa_record)
     except Exception as exc:
-        _log(log, f"[Debug] Build 导入条目构造失败: {exc}")
+        _log(log, f"[!] Build 导入条目构造失败: {exc}")
         return
     if not entry.get("access_token") or not entry.get("refresh_token"):
-        _log(log, "[Debug] Build 条目缺 token，跳过 g2a 导出")
+        _log(log, "[!] Build 条目缺 token，跳过 g2a 导出")
         return
 
     if config.get("g2a_build_import_file_enabled"):
@@ -222,7 +255,7 @@ def maybe_export_build_after_cpa(
                 append_build_import(path, entry, log=log)
                 _log(log, f"[g2a] 已更新本地导入文件 {path}")
             except Exception as exc:
-                _log(log, f"[Debug] 写本地 Build 导入文件失败: {exc}")
+                _log(log, f"[!] 写本地 Build 导入文件失败: {exc}")
 
     if not config.get("g2a_build_remote_import_enabled"):
         return
@@ -230,7 +263,7 @@ def maybe_export_build_after_cpa(
     user = str(config.get("chenyme_grok2api_username", "") or "").strip()
     password = str(config.get("chenyme_grok2api_password", "") or "").strip()
     if not base or not user or not password:
-        _log(log, "[Debug] g2a 远程导入开启但 chenyme 未配置，跳过")
+        _log(log, "[!] Build 远程导入已开但 chenyme 未配置，跳过")
         return
     try:
         for attempt in range(2):
@@ -244,4 +277,4 @@ def maybe_export_build_after_cpa(
                     continue
                 raise
     except Exception as exc:
-        _log(log, f"[Debug] chenyme accounts/import 失败: {exc}")
+        _log(log, f"[!] chenyme accounts/import 失败: {exc}")
