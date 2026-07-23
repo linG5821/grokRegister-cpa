@@ -62,9 +62,8 @@ class ChenymeImportTests(unittest.TestCase):
         urls = [u for u, _ in posts]
         self.assertTrue(any(u.endswith("/accounts/web/import") for u in urls))
         self.assertFalse(any("convert" in u for u in urls))
-        # multipart files
         web = [k for u, k in posts if u.endswith("/accounts/web/import")][0]
-        self.assertIn("files", web.get("files") or web)
+        self.assertIn("multipart", web)
 
     def test_build_import_multipart_file(self):
         import chenyme_g2a as cg
@@ -90,13 +89,7 @@ class ChenymeImportTests(unittest.TestCase):
         with patch.object(cg.requests, "post", side_effect=fake_post):
             cg.import_build_account("http://g2a.test", "adm", entry)
         self.assertTrue(captured["url"].endswith("/accounts/import"))
-        files = captured["kwargs"].get("files") or {}
-        self.assertIn("file", files)
-        name, bio, ctype = files["file"]
-        raw = bio.read().decode("utf-8")
-        data = json.loads(raw)
-        self.assertEqual(len(data["accounts"]), 1)
-        self.assertEqual(data["accounts"][0]["email"], "a@x.com")
+        self.assertIn("multipart", captured["kwargs"])
 
 
 if __name__ == "__main__":

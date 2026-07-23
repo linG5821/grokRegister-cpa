@@ -4,13 +4,12 @@
 """
 from __future__ import annotations
 
-import io
 import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from curl_cffi import requests
+from curl_cffi import CurlMime, requests
 
 from g2a_build_import import build_import_entry, single_account_payload
 
@@ -120,6 +119,38 @@ def _http_error(resp: Any, what: str) -> RuntimeError:
     return RuntimeError(f"{what} HTTP {code}: {_resp_preview(resp)}")
 
 
+def _multipart_post(
+    url: str,
+    admin_token: str,
+    field: str,
+    filename: str,
+    data: bytes,
+    content_type: str,
+    timeout: float,
+) -> Any:
+    """curl_cffi 不支持 files=，必须用 CurlMime multipart。"""
+    mp = CurlMime()
+    try:
+        mp.addpart(
+            name=field,
+            content_type=content_type,
+            filename=filename,
+            data=data,
+        )
+        return requests.post(
+            url,
+            headers={"Authorization": f"Bearer {admin_token}"},
+            multipart=mp,
+            timeout=timeout,
+            proxies={},
+        )
+    finally:
+        try:
+            mp.close()
+        except Exception:
+            pass
+
+
 def import_web_sso(
     base: str,
     admin_token: str,
@@ -136,15 +167,14 @@ def import_web_sso(
     # chenyme 管理端常见字段名为 files；失败时再试 file
     last_err: Optional[BaseException] = None
     for field in ("files", "file"):
-        files = {
-            field: ("grok-web-sso-tokens.txt", io.BytesIO(content), "text/plain"),
-        }
-        resp = requests.post(
+        resp = _multipart_post(
             endpoint,
-            headers={"Authorization": f"Bearer {admin_token}"},
-            files=files,
+            admin_token,
+            field=field,
+            filename="grok-web-sso-tokens.txt",
+            data=content,
+            content_type="text/plain",
             timeout=60,
-            proxies={},
         )
         code = int(getattr(resp, "status_code", 0) or 0)
         if code == 401:
@@ -177,15 +207,14 @@ def import_build_account(
     last_err: Optional[BaseException] = None
     # 用户实测字段名为 file；兼容 files
     for field in ("file", "files"):
-        files = {
-            field: ("grok-build-account.json", io.BytesIO(raw), "application/json"),
-        }
-        resp = requests.post(
+        resp = _multipart_post(
             endpoint,
-            headers={"Authorization": f"Bearer {admin_token}"},
-            files=files,
+            admin_token,
+            field=field,
+            filename="grok-build-account.json",
+            data=raw,
+            content_type="application/json",
             timeout=120,
-            proxies={},
         )
         code = int(getattr(resp, "status_code", 0) or 0)
         if code == 401:
