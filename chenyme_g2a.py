@@ -247,15 +247,14 @@ def maybe_export_build_after_cpa(
         return
 
     if config.get("g2a_build_import_file_enabled"):
-        path = str(config.get("g2a_build_import_file") or "grok2api_build_import.json").strip()
-        if path:
-            try:
-                from g2a_build_import import append_build_import
+        try:
+            from g2a_build_import import DEFAULT_IMPORT_FILE, append_build_import, resolve_import_path
 
-                append_build_import(path, entry, log=log)
-                _log(log, f"[g2a] 已更新本地导入文件 {path}")
-            except Exception as exc:
-                _log(log, f"[!] 写本地 Build 导入文件失败: {exc}")
+            path = resolve_import_path(config.get("g2a_build_import_file") or DEFAULT_IMPORT_FILE)
+            append_build_import(path, entry, log=log)
+            _log(log, f"[g2a] 已更新本地导入文件 {path}")
+        except Exception as exc:
+            _log(log, f"[!] 写本地 Build 导入文件失败: {exc}")
 
     if not config.get("g2a_build_remote_import_enabled"):
         return

@@ -20,6 +20,8 @@ config.local.*
 # 真实账号凭证 / OAuth token 输出，禁止提交
 auth_out.json
 auth_out/
+exports/
+grok2api_build_import.json
 auth_merged.json
 *.auth.json
 xai-*.json

@@ -28,7 +28,7 @@ python grok_register_ttk.py cli
   "chenyme_grok2api_username": "admin",
   "chenyme_grok2api_password": "...",
   "g2a_build_import_file_enabled": true,
-  "g2a_build_import_file": "grok2api_build_import.json",
+  "g2a_build_import_file": "exports/grok2api_build_import.json",
   "g2a_build_remote_import_enabled": true,
   "cpa_auto_add": true,
   "cpa_auth_dir": "./auth"

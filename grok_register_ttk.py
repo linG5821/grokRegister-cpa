@@ -170,7 +170,7 @@ DEFAULT_CONFIG = {
     "chenyme_grok2api_password": "",
     # 本地累加 grok2api Build 导入 JSON（CPA token 换出后）
     "g2a_build_import_file_enabled": False,
-    "g2a_build_import_file": "grok2api_build_import.json",
+    "g2a_build_import_file": "exports/grok2api_build_import.json",
     # 远程 multipart accounts/import（每号一文件，字段名 file）
     "g2a_build_remote_import_enabled": False,
     "mailnest_api_key": "",
@@ -2346,7 +2346,10 @@ class GrokRegisterGUI:
         self.chenyme_user_var = tk.StringVar(value=str(config.get("chenyme_grok2api_username", "")))
         self.chenyme_pass_var = tk.StringVar(value=str(config.get("chenyme_grok2api_password", "")))
         self.g2a_import_file_var = tk.StringVar(
-            value=str(config.get("g2a_build_import_file", "grok2api_build_import.json") or "grok2api_build_import.json")
+            value=str(
+                config.get("g2a_build_import_file", "exports/grok2api_build_import.json")
+                or "exports/grok2api_build_import.json"
+            )
         )
 
         tk_checkbutton(
@@ -2525,7 +2528,7 @@ class GrokRegisterGUI:
         config["chenyme_grok2api_password"] = self.chenyme_pass_var.get()
         config["g2a_build_import_file_enabled"] = bool(self.g2a_file_enabled_var.get())
         config["g2a_build_import_file"] = (
-            self.g2a_import_file_var.get().strip() or "grok2api_build_import.json"
+            self.g2a_import_file_var.get().strip() or "exports/grok2api_build_import.json"
         )
         config["g2a_build_remote_import_enabled"] = bool(self.g2a_remote_enabled_var.get())
 

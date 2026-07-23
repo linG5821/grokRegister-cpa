@@ -20,7 +20,7 @@
   "chenyme_grok2api_username": "",
   "chenyme_grok2api_password": "",
   "g2a_build_import_file_enabled": false,
-  "g2a_build_import_file": "grok2api_build_import.json",
+  "g2a_build_import_file": "exports/grok2api_build_import.json",
   "g2a_build_remote_import_enabled": false
 }
 ```

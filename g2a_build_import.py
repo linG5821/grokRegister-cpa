@@ -13,9 +13,20 @@ from typing import Any, Callable, Optional
 
 # xAI Grok CLI / Device Flow 固定 client_id（与 sso_to_auth_json.CLIENT_ID 一致）
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+# 默认放在项目 exports/ 下，避免污染仓库根目录
+DEFAULT_IMPORT_FILE = os.path.join("exports", "grok2api_build_import.json")
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 _write_lock = threading.Lock()
 LogFn = Optional[Callable[[str], None]]
+
+
+def resolve_import_path(file_path: str = "") -> str:
+    """相对路径按项目根解析；空则用 DEFAULT_IMPORT_FILE。"""
+    path = str(file_path or "").strip() or DEFAULT_IMPORT_FILE
+    if os.path.isabs(path):
+        return path
+    return os.path.normpath(os.path.join(_PROJECT_ROOT, path))
 
 
 def _log(log: LogFn, msg: str) -> None:
@@ -139,10 +150,8 @@ def _atomic_write(path: str, accounts: list[dict]) -> None:
 
 
 def append_build_import(file_path: str, entry: dict, log: LogFn = None) -> None:
-    """累加写入；同 email 覆盖。"""
-    path = str(file_path or "").strip()
-    if not path:
-        return
+    """累加写入；同 email 覆盖。路径默认 exports/ 下，相对路径相对项目根。"""
+    path = resolve_import_path(file_path)
     email = str((entry or {}).get("email") or (entry or {}).get("name") or "").strip().lower()
     with _write_lock:
         accounts, corrupted = _load_accounts(path)
