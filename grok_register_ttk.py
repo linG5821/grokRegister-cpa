@@ -163,6 +163,16 @@ DEFAULT_CONFIG = {
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
+    # chenyme grok2api：仅 Web SSO 导入（永不 convert-to-build）
+    "chenyme_grok2api_enabled": False,
+    "chenyme_grok2api_base": "",
+    "chenyme_grok2api_username": "",
+    "chenyme_grok2api_password": "",
+    # 本地累加 grok2api Build 导入 JSON（CPA token 换出后）
+    "g2a_build_import_file_enabled": False,
+    "g2a_build_import_file": "grok2api_build_import.json",
+    # 远程 multipart accounts/import（每号一文件，字段名 file）
+    "g2a_build_remote_import_enabled": False,
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -590,14 +600,30 @@ def register_account_once(log_callback=None, cancel_callback=None):
     return email, profile.get("password", ""), sso, profile
 
 
+def _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=None, log_callback=None):
+    """后处理：chenyme web SSO 导入 + Build 本地/远程导入。失败只打日志。"""
+    try:
+        from chenyme_g2a import maybe_export_build_after_cpa, maybe_import_web_sso
+
+        if cpa_record:
+            maybe_export_build_after_cpa(config, cpa_record, log=log_callback)
+        maybe_import_web_sso(config, sso, log=log_callback)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] chenyme/g2a 后处理异常: {exc}")
+
+
 def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> bool:
     """SSO → 授权码流程换 token → 写入本地 CPA auth 目录和/或远程 CPA。
 
     返回 True 表示 CPA 入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
     """
+    sso = _normalize_sso_token(raw_token)
     if not config.get("cpa_auto_add", False):
         if log_callback:
             log_callback("[*] 已关闭 SSO→CPA auth，仅保存 SSO（不写 auth）")
+        if sso:
+            _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=None, log_callback=log_callback)
         return True
     auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
     remote_url = str(config.get("cpa_remote_url", "") or "").strip()
@@ -605,14 +631,17 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
     if not auth_dir and not remote_url:
         if log_callback:
             log_callback("[Debug] 已开启 CPA 直出但未配置 cpa_auth_dir 或 cpa_remote_url，跳过")
+        if sso:
+            _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=None, log_callback=log_callback)
         return True
     if remote_url and not management_key:
         if log_callback:
             log_callback("[Debug] 已配置 cpa_remote_url 但未配置 cpa_management_key，跳过远程上传")
         remote_url = ""
     if not auth_dir and not remote_url:
+        if sso:
+            _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=None, log_callback=log_callback)
         return True
-    sso = _normalize_sso_token(raw_token)
     if not sso:
         return False
     proxy = _resolve_cpa_proxy()
@@ -638,6 +667,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
                 return False
             _cpa_log("Device Flow 换 token 失败；SSO 已在 accounts 文件，稍后可重转")
             _append_sso_pending(email, sso, log_callback=log_callback)
+            _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=None, log_callback=log_callback)
             return False
         if should_stop and should_stop():
             _cpa_log("用户停止，跳过 auth 写入")
@@ -665,6 +695,9 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
         if remote_url:
             if should_stop and should_stop():
                 _cpa_log("用户停止，跳过远程上传")
+                _maybe_chenyme_and_g2a_side_exports(
+                    sso, cpa_record=record if wrote_ok else None, log_callback=log_callback
+                )
                 return wrote_ok
             try:
                 name = _s2cpa.upload_cpa_auth_remote(remote_url, management_key, record)
@@ -675,6 +708,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
         if not wrote_ok:
             _cpa_log("token 已换出但本地/远程均未写入成功")
             _append_sso_pending(email, sso, log_callback=log_callback)
+            _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=None, log_callback=log_callback)
             return False
         # 测活：对齐健康号路径，新 token 可能瞬时 403，内置 warmup+retry
         try:
@@ -686,6 +720,8 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
                 _cpa_log("测活未通过，仍保留 auth（可稍后重试 probe）")
         except Exception as probe_exc:
             _cpa_log(f"probe 异常: {probe_exc}")
+        # token 已换出：即使 probe 非 200 仍可导出 Build 导入
+        _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=record, log_callback=log_callback)
         return True
     except Exception as exc:
         if should_stop and should_stop():
@@ -693,6 +729,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
             return False
         _cpa_log(f"直出失败: {exc}")
         _append_sso_pending(email, sso, log_callback=log_callback)
+        _maybe_chenyme_and_g2a_side_exports(sso, cpa_record=None, log_callback=log_callback)
         return False
 
 

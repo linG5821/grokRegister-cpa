@@ -1,0 +1,247 @@
+"""chenyme grok2api：Web SSO 导入 + Build accounts/import（multipart file）。
+
+永不调用 convert-to-build。
+"""
+from __future__ import annotations
+
+import io
+import json
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+
+from curl_cffi import requests
+
+from g2a_build_import import build_import_entry, single_account_payload
+
+LogFn = Optional[Callable[[str], None]]
+
+_token = ""
+_token_expires_at: Optional[datetime] = None
+
+
+def _log(log: LogFn, msg: str) -> None:
+    if log:
+        try:
+            log(msg)
+        except Exception:
+            pass
+
+
+def normalize_base(base: str) -> str:
+    return str(base or "").strip().rstrip("/")
+
+
+def clear_token_cache() -> None:
+    global _token, _token_expires_at
+    _token = ""
+    _token_expires_at = None
+
+
+def login(base: str, username: str, password: str, log: LogFn = None) -> str:
+    global _token, _token_expires_at
+    root = normalize_base(base)
+    if not root or not username or not password:
+        raise RuntimeError("chenyme base/username/password 未配置")
+    endpoint = f"{root}/api/admin/v1/auth/login"
+    resp = requests.post(
+        endpoint,
+        headers={"Content-Type": "application/json"},
+        json={"username": username, "password": password},
+        timeout=30,
+        proxies={},
+    )
+    resp.raise_for_status()
+    payload = resp.json() if hasattr(resp, "json") else {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    access = ""
+    expires_at = None
+    if isinstance(tokens, dict):
+        access = str(tokens.get("accessToken") or "").strip()
+        raw_exp = tokens.get("accessTokenExpiresAt") or ""
+        if raw_exp:
+            try:
+                text = str(raw_exp).replace("Z", "+00:00")
+                expires_at = datetime.fromisoformat(text)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+            except Exception:
+                expires_at = None
+    if not access:
+        raise RuntimeError("chenyme 登录响应缺少 accessToken")
+    _token = access
+    if expires_at is None:
+        _token_expires_at = datetime.fromtimestamp(time.time() + 50 * 60, tz=timezone.utc)
+    else:
+        _token_expires_at = expires_at
+    _log(log, "[chenyme] 登录成功")
+    return access
+
+
+def get_access_token(
+    base: str,
+    username: str,
+    password: str,
+    log: LogFn = None,
+    force_refresh: bool = False,
+) -> str:
+    global _token, _token_expires_at
+    now = datetime.now(timezone.utc)
+    if (
+        not force_refresh
+        and _token
+        and _token_expires_at
+        and (_token_expires_at - now).total_seconds() > 60
+    ):
+        return _token
+    return login(base, username, password, log=log)
+
+
+def _normalize_sso(raw: str) -> str:
+    sso = str(raw or "").strip()
+    if sso.lower().startswith("sso="):
+        sso = sso[4:].strip()
+    return sso
+
+
+def import_web_sso(
+    base: str,
+    admin_token: str,
+    sso_token: str,
+    log: LogFn = None,
+) -> bool:
+    """POST /api/admin/v1/accounts/web/import — multipart 纯 SSO 一行。"""
+    root = normalize_base(base)
+    sso = _normalize_sso(sso_token)
+    if not root or not admin_token or not sso:
+        return False
+    endpoint = f"{root}/api/admin/v1/accounts/web/import"
+    content = (sso + "\n").encode("utf-8")
+    files = {
+        "files": ("grok-web-sso-tokens.txt", io.BytesIO(content), "text/plain"),
+    }
+    resp = requests.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {admin_token}"},
+        files=files,
+        timeout=60,
+        proxies={},
+    )
+    if resp.status_code == 401:
+        raise RuntimeError("chenyme unauthorized")
+    resp.raise_for_status()
+    # 消费 SSE/body
+    _ = getattr(resp, "text", "") or ""
+    _log(log, "[chenyme] web/import SSO 完成")
+    return True
+
+
+def import_build_account(
+    base: str,
+    admin_token: str,
+    entry: dict,
+    log: LogFn = None,
+) -> bool:
+    """POST /api/admin/v1/accounts/import — multipart 字段 file，单号 accounts JSON。"""
+    root = normalize_base(base)
+    if not root or not admin_token or not entry:
+        return False
+    endpoint = f"{root}/api/admin/v1/accounts/import"
+    payload = single_account_payload(entry)
+    raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    files = {
+        "file": ("grok-build-account.json", io.BytesIO(raw), "application/json"),
+    }
+    resp = requests.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {admin_token}"},
+        files=files,
+        timeout=120,
+        proxies={},
+    )
+    if resp.status_code == 401:
+        raise RuntimeError("chenyme unauthorized")
+    resp.raise_for_status()
+    _ = getattr(resp, "text", "") or ""
+    email = str(entry.get("email") or entry.get("name") or "")
+    _log(log, f"[chenyme] accounts/import Build 完成 ({email})")
+    return True
+
+
+def maybe_import_web_sso(config: dict, sso: str, log: LogFn = None) -> None:
+    if not config.get("chenyme_grok2api_enabled"):
+        return
+    base = normalize_base(config.get("chenyme_grok2api_base", ""))
+    user = str(config.get("chenyme_grok2api_username", "") or "").strip()
+    password = str(config.get("chenyme_grok2api_password", "") or "").strip()
+    if not base or not user or not password:
+        _log(log, "[Debug] chenyme 未配置 base/账号，跳过 SSO 导入")
+        return
+    sso_n = _normalize_sso(sso)
+    if not sso_n:
+        return
+    try:
+        for attempt in range(2):
+            try:
+                token = get_access_token(base, user, password, log=log, force_refresh=(attempt > 0))
+                import_web_sso(base, token, sso_n, log=log)
+                return
+            except RuntimeError as exc:
+                if "unauthorized" in str(exc).lower() and attempt == 0:
+                    clear_token_cache()
+                    continue
+                raise
+    except Exception as exc:
+        _log(log, f"[Debug] chenyme web/import 失败: {exc}")
+
+
+def maybe_export_build_after_cpa(
+    config: dict,
+    cpa_record: dict,
+    log: LogFn = None,
+) -> None:
+    """CPA record 成功后：本地累加文件 + 可选远程 multipart import。"""
+    if not cpa_record:
+        return
+    try:
+        entry = build_import_entry(cpa_record)
+    except Exception as exc:
+        _log(log, f"[Debug] Build 导入条目构造失败: {exc}")
+        return
+    if not entry.get("access_token") or not entry.get("refresh_token"):
+        _log(log, "[Debug] Build 条目缺 token，跳过 g2a 导出")
+        return
+
+    if config.get("g2a_build_import_file_enabled"):
+        path = str(config.get("g2a_build_import_file") or "grok2api_build_import.json").strip()
+        if path:
+            try:
+                from g2a_build_import import append_build_import
+
+                append_build_import(path, entry, log=log)
+                _log(log, f"[g2a] 已更新本地导入文件 {path}")
+            except Exception as exc:
+                _log(log, f"[Debug] 写本地 Build 导入文件失败: {exc}")
+
+    if not config.get("g2a_build_remote_import_enabled"):
+        return
+    base = normalize_base(config.get("chenyme_grok2api_base", ""))
+    user = str(config.get("chenyme_grok2api_username", "") or "").strip()
+    password = str(config.get("chenyme_grok2api_password", "") or "").strip()
+    if not base or not user or not password:
+        _log(log, "[Debug] g2a 远程导入开启但 chenyme 未配置，跳过")
+        return
+    try:
+        for attempt in range(2):
+            try:
+                token = get_access_token(base, user, password, log=log, force_refresh=(attempt > 0))
+                import_build_account(base, token, entry, log=log)
+                return
+            except RuntimeError as exc:
+                if "unauthorized" in str(exc).lower() and attempt == 0:
+                    clear_token_cache()
+                    continue
+                raise
+    except Exception as exc:
+        _log(log, f"[Debug] chenyme accounts/import 失败: {exc}")
