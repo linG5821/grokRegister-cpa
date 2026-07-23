@@ -2324,10 +2324,81 @@ class GrokRegisterGUI:
         c_label(2, 2, "管理密钥:")
         c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_management_key_var, width=28), 2, 3)
 
+        # chenyme grok2api + Build 导入（可选）
+        self.g2a_frame = tk.LabelFrame(
+            config_frame,
+            text="chenyme grok2api（可选，无 convert）",
+            bg=UI_PANEL_BG,
+            fg=UI_FG,
+            padx=8,
+            pady=6,
+            relief=tk.GROOVE,
+            borderwidth=1,
+        )
+        self.g2a_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.g2a_frame.grid_columnconfigure(1, weight=1, minsize=240)
+        self.g2a_frame.grid_columnconfigure(3, weight=1, minsize=240)
+
+        self.chenyme_enabled_var = tk.BooleanVar(value=bool(config.get("chenyme_grok2api_enabled", False)))
+        self.g2a_file_enabled_var = tk.BooleanVar(value=bool(config.get("g2a_build_import_file_enabled", False)))
+        self.g2a_remote_enabled_var = tk.BooleanVar(value=bool(config.get("g2a_build_remote_import_enabled", False)))
+        self.chenyme_base_var = tk.StringVar(value=str(config.get("chenyme_grok2api_base", "")))
+        self.chenyme_user_var = tk.StringVar(value=str(config.get("chenyme_grok2api_username", "")))
+        self.chenyme_pass_var = tk.StringVar(value=str(config.get("chenyme_grok2api_password", "")))
+        self.g2a_import_file_var = tk.StringVar(
+            value=str(config.get("g2a_build_import_file", "grok2api_build_import.json") or "grok2api_build_import.json")
+        )
+
+        tk_checkbutton(
+            self.g2a_frame,
+            text="注册成功后导入 Web SSO 到 chenyme（仅 web/import，永不 convert-to-build）",
+            variable=self.chenyme_enabled_var,
+        ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=2)
+        tk_checkbutton(
+            self.g2a_frame,
+            text="CPA 换 token 后累加写入本地 Build 导入 JSON",
+            variable=self.g2a_file_enabled_var,
+        ).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=2)
+        tk_checkbutton(
+            self.g2a_frame,
+            text="CPA 换 token 后远程 multipart 导入 Build（每号一文件，字段 file）",
+            variable=self.g2a_remote_enabled_var,
+        ).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=2)
+
+        self._g2a_detail_widgets = []
+
+        def g_label(row, col, text):
+            w = tk_label(self.g2a_frame, text=text, bg=UI_PANEL_BG)
+            w.grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=3)
+            self._g2a_detail_widgets.append(w)
+            return w
+
+        def g_field(widget, row, col, columnspan=1, sticky=tk.EW):
+            widget.grid(row=row, column=col, columnspan=columnspan, sticky=sticky, padx=(0, 14), pady=3)
+            self._g2a_detail_widgets.append(widget)
+            return widget
+
+        g_label(3, 0, "站点 base:")
+        g_field(tk_entry(self.g2a_frame, textvariable=self.chenyme_base_var, width=40), 3, 1, columnspan=3)
+        g_label(4, 0, "管理员:")
+        g_field(tk_entry(self.g2a_frame, textvariable=self.chenyme_user_var, width=20), 4, 1)
+        g_label(4, 2, "密码:")
+        g_field(
+            tk_entry(self.g2a_frame, textvariable=self.chenyme_pass_var, width=20, show="*"),
+            4,
+            3,
+        )
+        g_label(5, 0, "本地 JSON:")
+        g_field(tk_entry(self.g2a_frame, textvariable=self.g2a_import_file_var, width=40), 5, 1, columnspan=3)
+
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
+        self.chenyme_enabled_var.trace_add("write", lambda *_: self._refresh_g2a_fields())
+        self.g2a_file_enabled_var.trace_add("write", lambda *_: self._refresh_g2a_fields())
+        self.g2a_remote_enabled_var.trace_add("write", lambda *_: self._refresh_g2a_fields())
         self._refresh_provider_fields()
         self._refresh_cpa_fields()
+        self._refresh_g2a_fields()
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -2428,6 +2499,36 @@ class GrokRegisterGUI:
             else:
                 widget.grid_remove()
 
+    def _refresh_g2a_fields(self):
+        """任一 chenyme/g2a 开关打开时显示 base/账号/本地路径。"""
+        need = bool(
+            getattr(self, "chenyme_enabled_var", None)
+            and (
+                self.chenyme_enabled_var.get()
+                or self.g2a_file_enabled_var.get()
+                or self.g2a_remote_enabled_var.get()
+            )
+        )
+        for widget in getattr(self, "_g2a_detail_widgets", []):
+            if need:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _apply_g2a_config_from_ui(self):
+        """把 chenyme / g2a 相关 UI 写入全局 config。"""
+        if not hasattr(self, "chenyme_enabled_var"):
+            return
+        config["chenyme_grok2api_enabled"] = bool(self.chenyme_enabled_var.get())
+        config["chenyme_grok2api_base"] = self.chenyme_base_var.get().strip()
+        config["chenyme_grok2api_username"] = self.chenyme_user_var.get().strip()
+        config["chenyme_grok2api_password"] = self.chenyme_pass_var.get()
+        config["g2a_build_import_file_enabled"] = bool(self.g2a_file_enabled_var.get())
+        config["g2a_build_import_file"] = (
+            self.g2a_import_file_var.get().strip() or "grok2api_build_import.json"
+        )
+        config["g2a_build_remote_import_enabled"] = bool(self.g2a_remote_enabled_var.get())
+
     def log(self, message):
         if not should_emit_log(message):
             return
@@ -2504,6 +2605,7 @@ class GrokRegisterGUI:
             config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
             config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
             config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+            self._apply_g2a_config_from_ui()
         except Exception:
             pass
         self.log("[*] 开始连通性检查...")
@@ -2751,6 +2853,7 @@ class GrokRegisterGUI:
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
         config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        self._apply_g2a_config_from_ui()
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -2780,6 +2883,24 @@ class GrokRegisterGUI:
         if config.get("cpa_auto_add") and not config.get("cpa_auth_dir") and not config.get("cpa_remote_url"):
             self.log("[!] 已开启 SSO→auth，但未配置 auth 目录或远程地址")
             return
+        need_chenyme_cred = config.get("chenyme_grok2api_enabled") or config.get(
+            "g2a_build_remote_import_enabled"
+        )
+        if need_chenyme_cred:
+            missing_g2a = []
+            if not str(config.get("chenyme_grok2api_base") or "").strip():
+                missing_g2a.append("chenyme 站点 base")
+            if not str(config.get("chenyme_grok2api_username") or "").strip():
+                missing_g2a.append("管理员账号")
+            if not str(config.get("chenyme_grok2api_password") or "").strip():
+                missing_g2a.append("管理员密码")
+            if missing_g2a:
+                self.log(f"[!] 已开启 chenyme/远程 Build 导入，缺少: {', '.join(missing_g2a)}")
+                return
+        if config.get("g2a_build_import_file_enabled") or config.get("g2a_build_remote_import_enabled"):
+            if not config.get("cpa_auto_add"):
+                self.log("[!] Build 导入依赖 CPA 换 token，请同时开启「SSO → CPA auth」")
+                return
         try:
             count = int(self.count_var.get())
         except Exception:
@@ -2832,6 +2953,12 @@ class GrokRegisterGUI:
         if int(self.workers_var.get() or 1) > count:
             self.log(f"[*] 并发已自动调整为 {workers}（不超过注册数量）")
         self.log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
+        self.log(
+            f"[*] chenyme SSO导入: {'开' if config.get('chenyme_grok2api_enabled') else '关'} | "
+            f"Build本地JSON: {'开' if config.get('g2a_build_import_file_enabled') else '关'} | "
+            f"Build远程import: {'开' if config.get('g2a_build_remote_import_enabled') else '关'}"
+        )
+
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
         threading.Thread(
             target=self._run_registration_entry,
