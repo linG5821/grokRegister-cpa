@@ -21,6 +21,12 @@ class ProtocolSigninHelpers(unittest.TestCase):
         self.assertIn('input[type="password"]', psi._PASS_SELECTORS)
         self.assertEqual(psi.SIGNIN_URL, "https://accounts.x.ai/sign-in")
 
+    def test_cf_helpers_exist(self):
+        self.assertTrue(callable(psi._page_cf_challenge))
+        self.assertTrue(callable(psi._click_turnstile_widget))
+        self.assertTrue(callable(psi._wait_cf_and_turnstile))
+        self.assertTrue(callable(psi._read_turnstile_token))
+
 
 if __name__ == "__main__":
     unittest.main()

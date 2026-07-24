@@ -270,11 +270,203 @@ async def _read_sso_cookie(context) -> str:
     return ""
 
 
+async def _page_cf_challenge(page) -> bool:
+    """True = 仍卡在 Cloudflare 整页挑战（Just a moment 等）。"""
+    try:
+        info = await page.evaluate(
+            """() => {
+              const title = (document.title || '').toLowerCase();
+              const body = ((document.body && document.body.innerText) || '').slice(0, 500).toLowerCase();
+              const html = (document.documentElement && document.documentElement.innerHTML || '').slice(0, 2000).toLowerCase();
+              const jammed =
+                title.includes('just a moment') ||
+                body.includes('just a moment') ||
+                body.includes('checking your browser') ||
+                body.includes('verify you are human') ||
+                body.includes('needs to review the security') ||
+                html.includes('cf-browser-verification') ||
+                html.includes('challenge-platform');
+              const hasApp =
+                !!document.querySelector('[data-testid="continue-with-email"]') ||
+                !!document.querySelector('input[type="email"], input[name="email"], input[type="password"]') ||
+                !!document.querySelector('button');
+              return { jammed, hasApp, title: document.title || '' };
+            }"""
+        )
+        if not info:
+            return False
+        # 有登录 UI 则不算整页挑战
+        if info.get("hasApp") and not info.get("jammed"):
+            return False
+        return bool(info.get("jammed"))
+    except Exception:
+        return False
+
+
+async def _read_turnstile_token(page) -> str:
+    try:
+        tok = await page.evaluate(
+            """() => {
+              try {
+                const byInput = String(
+                  (document.querySelector('input[name="cf-turnstile-response"]') || {}).value || ''
+                ).trim();
+                if (byInput) return byInput;
+                if (window.turnstile && typeof turnstile.getResponse === 'function') {
+                  return String(turnstile.getResponse() || '').trim();
+                }
+              } catch (e) {}
+              return '';
+            }"""
+        )
+        return str(tok or "").strip()
+    except Exception:
+        return ""
+
+
+async def _click_turnstile_widget(page, log: LogFn = None) -> None:
+    """对齐 turnstile_mint / register_flow：点 Turnstile 中心 + 尝试 iframe 复选框。"""
+    # 1) 点 .cf-turnstile / [data-sitekey] 中心
+    try:
+        box = await page.evaluate(
+            """() => {
+              const e = document.querySelector(
+                '.cf-turnstile, [data-sitekey], iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
+              );
+              if (!e) return null;
+              const r = e.getBoundingClientRect();
+              if (!r.width && !r.height) return null;
+              return { x: r.left + r.width / 2, y: r.top + Math.min(r.height / 2, 30) };
+            }"""
+        )
+        if box:
+            x, y = float(box["x"]), float(box["y"])
+            await page.mouse.move(max(0, x - 20), max(0, y - 6))
+            await page.mouse.move(x, y, steps=6)
+            await page.mouse.down()
+            await asyncio.sleep(0.05)
+            await page.mouse.up()
+            _log(log, "[relogin] 已点击 Turnstile 区域")
+    except Exception:
+        pass
+
+    # 2) frame 内 checkbox（managed / non-interactive 也可能有）
+    try:
+        for frame in page.frames:
+            url = (frame.url or "").lower()
+            if "turnstile" not in url and "challenges.cloudflare" not in url:
+                continue
+            for sel in (
+                'input[type="checkbox"]',
+                "label",
+                ".ctp-checkbox-label",
+                "#challenge-stage",
+                "body",
+            ):
+                try:
+                    loc = frame.locator(sel).first
+                    if await loc.count() == 0:
+                        continue
+                    await loc.click(timeout=1500, force=True)
+                    _log(log, f"[relogin] 已点 Turnstile frame: {sel}")
+                    return
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 3) 兜底：点任意含 turnstile 的节点
+    try:
+        await page.evaluate(
+            """() => {
+              const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
+                const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
+                return String(txt).toLowerCase().includes('turnstile')
+                  || String(txt).toLowerCase().includes('challenges.cloudflare');
+              });
+              if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
+            }"""
+        )
+    except Exception:
+        pass
+
+
+async def _wait_cf_and_turnstile(
+    page,
+    *,
+    timeout: float = 90,
+    log: LogFn = None,
+    need_token: bool = False,
+) -> str:
+    """等整页 CF 过掉；可选等到 Turnstile token（长度>=80）。返回 token（可空）。"""
+    deadline = asyncio.get_event_loop().time() + timeout
+    last_click = 0.0
+    logged_cf = False
+    while asyncio.get_event_loop().time() < deadline:
+        if await _page_cf_challenge(page):
+            if not logged_cf:
+                _log(log, "[relogin] 检测到 Cloudflare 人机/挑战页，等待通过…")
+                logged_cf = True
+            now = asyncio.get_event_loop().time()
+            if now - last_click >= 2.5:
+                await _click_turnstile_widget(page, log=log)
+                last_click = now
+            await page.wait_for_timeout(800)
+            continue
+
+        tok = await _read_turnstile_token(page)
+        if tok and len(tok) >= 80:
+            _log(log, f"[relogin] Turnstile 已通过，token 长度={len(tok)}")
+            return tok
+
+        # 页面上有 widget 但还没 token
+        try:
+            present = await page.evaluate(
+                """() => !!(
+                  document.querySelector('input[name="cf-turnstile-response"]') ||
+                  document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]')
+                )"""
+            )
+        except Exception:
+            present = False
+        if present:
+            now = asyncio.get_event_loop().time()
+            if now - last_click >= 3.0:
+                await _click_turnstile_widget(page, log=log)
+                last_click = now
+            if need_token:
+                await page.wait_for_timeout(700)
+                continue
+            # 不强制 token 时：widget 存在但尚未出 token 也先返回，让后续再轮询
+            await page.wait_for_timeout(500)
+            if not need_token:
+                return tok or ""
+        else:
+            # 无挑战无 widget
+            if not need_token:
+                return ""
+            await page.wait_for_timeout(500)
+
+    tok = await _read_turnstile_token(page)
+    if need_token and (not tok or len(tok) < 80):
+        raise RuntimeError("Cloudflare/Turnstile 超时未通过")
+    return tok or ""
+
+
+def _extension_path() -> str:
+    root = os.path.dirname(os.path.abspath(__file__))
+    for name in ("turnstilePatch", "turnstile_patch"):
+        p = os.path.join(root, name)
+        if os.path.isdir(p):
+            return p
+    return ""
+
+
 async def _login_async(
     email: str,
     password: str,
     proxy: str = "",
-    timeout: float = 120,
+    timeout: float = 150,
     headless: bool = False,
     log: LogFn = None,
 ) -> str:
@@ -290,50 +482,90 @@ async def _login_async(
     elif env_headless in ("0", "false", "no", "off"):
         headless = False
 
+    # 过 CF 时屏外窗口常失败；默认可见小窗（可用 env 强制屏外）
+    offscreen = (os.environ.get("GROK_RELOGIN_OFFSCREEN") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
     args = [
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-dev-shm-usage",
+        "--disable-infobars",
+        "--window-size=1000,800",
     ]
-    if not headless:
+    if not headless and offscreen:
         args.extend(
             [
                 "--window-position=-32000,-32000",
-                "--window-size=900,700",
                 "--start-minimized",
             ]
         )
-    launch: dict = {"executable_path": chrome, "headless": bool(headless), "args": args}
+    launch: dict = {
+        "executable_path": chrome,
+        "headless": bool(headless),
+        "args": args,
+    }
+    ext = _extension_path()
+    if ext:
+        launch["args"] = list(launch["args"]) + [
+            f"--disable-extensions-except={ext}",
+            f"--load-extension={ext}",
+        ]
+        _log(log, f"[relogin] 加载扩展: {ext}")
     if proxy:
         launch["proxy"] = {"server": proxy}
 
-    _log(log, f"[relogin] 打开登录页 chrome={chrome} headless={headless}")
+    _log(
+        log,
+        f"[relogin] 打开登录页 chrome={chrome} headless={headless} offscreen={offscreen}",
+    )
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**launch)
         try:
-            context = await browser.new_context(viewport={"width": 900, "height": 700})
+            context = await browser.new_context(
+                viewport={"width": 1000, "height": 800},
+                locale="en-US",
+            )
             await context.add_init_script(
-                'Object.defineProperty(navigator,"webdriver",{get:()=>undefined})'
+                """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                """
             )
             page = await context.new_page()
             await page.goto(SIGNIN_URL, timeout=60000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(1200)
+
+            # 0) 整页 CF 挑战（Just a moment）— 不过就没有 Login with email
+            try:
+                await _wait_cf_and_turnstile(
+                    page, timeout=min(60.0, timeout * 0.4), log=log, need_token=False
+                )
+            except RuntimeError as exc:
+                _log(log, f"[relogin] 进站 CF 未完全通过: {exc}，继续尝试…")
 
             # 1) 首页只有 OAuth + Login with email
             email_ready = False
-            for attempt in range(3):
+            for attempt in range(5):
+                if await _page_cf_challenge(page):
+                    await _click_turnstile_widget(page, log=log)
+                    await page.wait_for_timeout(1500)
                 if await _fill_by_selectors(page, _EMAIL_SELECTORS, email):
                     email_ready = True
                     break
                 clicked = await _click_continue_with_email(page, log=log)
                 if not clicked and attempt == 0:
-                    _log(log, "[relogin] 未看到 continue-with-email，继续探测输入框…")
-                await page.wait_for_timeout(800)
+                    _log(log, "[relogin] 未看到 continue-with-email，继续探测…")
+                await page.wait_for_timeout(900)
 
             if not email_ready:
-                # 诊断快照
                 try:
                     snap = await page.evaluate(
                         """() => ({
@@ -347,19 +579,31 @@ async def _login_async(
                           })).slice(0, 12),
                           buttons: Array.from(document.querySelectorAll('button'))
                             .map(n => (n.innerText||'').trim().slice(0,60)).filter(Boolean).slice(0, 12),
+                          cf: ((document.body&&document.body.innerText)||'').slice(0,120),
                         })"""
                     )
                     _log(log, f"[relogin] 页面诊断: {snap}")
                 except Exception:
                     pass
-                raise RuntimeError("登录页未找到邮箱输入框（需先点 Login with email）")
+                raise RuntimeError(
+                    "登录页未找到邮箱输入框（可能仍卡在 Cloudflare，或需先点 Login with email）"
+                )
 
             _log(log, "[relogin] 邮箱已填")
 
             # 2) 若无密码框，点 Continue/下一步
             pass_ready = await _fill_by_selectors(page, _PASS_SELECTORS, password)
             if not pass_ready:
-                for label in ("Continue", "继续", "Next", "下一步", "Log in", "Login", "Sign in", "登录"):
+                for label in (
+                    "Continue",
+                    "继续",
+                    "Next",
+                    "下一步",
+                    "Log in",
+                    "Login",
+                    "Sign in",
+                    "登录",
+                ):
                     try:
                         btn = page.get_by_role("button", name=re.compile(label, re.I))
                         if await btn.count():
@@ -368,7 +612,6 @@ async def _login_async(
                             break
                     except Exception:
                         pass
-                # submit 类型
                 try:
                     sub = page.locator('button[type="submit"]').first
                     if await sub.count():
@@ -380,32 +623,86 @@ async def _login_async(
 
             if not pass_ready:
                 raise RuntimeError("登录页未找到密码输入框")
-            _log(log, "[relogin] 密码已填，等待 Turnstile / 提交…")
+            _log(log, "[relogin] 密码已填，处理 Cloudflare / Turnstile…")
 
-            deadline = asyncio.get_event_loop().time() + timeout
+            # 3) 提交前必须等人机（与注册 fill_profile 一致）
+            try:
+                await _wait_cf_and_turnstile(
+                    page, timeout=min(75.0, timeout * 0.5), log=log, need_token=True
+                )
+            except RuntimeError:
+                # managed 模式有时 token 不在 input 里，仍尝试提交
+                _log(log, "[relogin] Turnstile token 未读到，尝试点击后提交…")
+                await _click_turnstile_widget(page, log=log)
+                await page.wait_for_timeout(2000)
+
+            deadline = asyncio.get_event_loop().time() + max(30.0, timeout * 0.5)
             submitted = False
+            last_cf_try = 0.0
             while asyncio.get_event_loop().time() < deadline:
-                if not submitted:
-                    for label in ("Log in", "Login", "Sign in", "登录", "Continue", "继续"):
+                # 若又弹出 CF，先过
+                if await _page_cf_challenge(page):
+                    await _click_turnstile_widget(page, log=log)
+                    await page.wait_for_timeout(1000)
+
+                tok = await _read_turnstile_token(page)
+                if tok and len(tok) < 80:
+                    now = asyncio.get_event_loop().time()
+                    if now - last_cf_try >= 3.0:
+                        await _click_turnstile_widget(page, log=log)
+                        last_cf_try = now
+
+                # 有 widget 且 token 太短时不要硬点登录
+                try:
+                    cf_present = await page.evaluate(
+                        """() => !!(
+                          document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]')
+                        )"""
+                    )
+                except Exception:
+                    cf_present = False
+                if cf_present and (not tok or len(tok) < 80):
+                    await page.wait_for_timeout(700)
+                    # 仍允许偶尔点一次登录（有的 managed 交互后才出 token）
+                    if not submitted and asyncio.get_event_loop().time() + 40 < deadline:
+                        pass
+                    else:
+                        if not submitted:
+                            pass
+
+                if not submitted or (cf_present and tok and len(tok) >= 80):
+                    for label in (
+                        "Log in",
+                        "Login",
+                        "Sign in",
+                        "登录",
+                        "Continue",
+                        "继续",
+                    ):
                         try:
-                            btn = page.get_by_role("button", name=re.compile(label, re.I))
+                            btn = page.get_by_role(
+                                "button", name=re.compile(label, re.I)
+                            )
                             if await btn.count():
-                                await btn.first.click(timeout=2000)
-                                submitted = True
-                                _log(log, f"[relogin] 已点击: {label}")
-                                break
+                                # token 未就绪时少点；已就绪或已等很久再点
+                                if (not cf_present) or (tok and len(tok) >= 80) or submitted:
+                                    await btn.first.click(timeout=2000)
+                                    submitted = True
+                                    _log(log, f"[relogin] 已点击: {label}")
+                                    break
                         except Exception:
                             pass
                     if not submitted:
                         try:
                             sub = page.locator('button[type="submit"]').first
                             if await sub.count():
-                                await sub.click(timeout=2000)
-                                submitted = True
-                                _log(log, "[relogin] 已点击 submit")
+                                if (not cf_present) or (tok and len(tok) >= 80):
+                                    await sub.click(timeout=2000)
+                                    submitted = True
+                                    _log(log, "[relogin] 已点击 submit")
                         except Exception:
                             pass
-                    if not submitted:
+                    if not submitted and (not cf_present or (tok and len(tok) >= 80)):
                         try:
                             await page.keyboard.press("Enter")
                             submitted = True
@@ -418,7 +715,10 @@ async def _login_async(
                     return sso
 
                 url = (page.url or "").lower()
-                if any(k in url for k in ("cookie", "set-cookie", "exchange", "sso", "grok.com")):
+                if any(
+                    k in url
+                    for k in ("cookie", "set-cookie", "exchange", "sso", "grok.com")
+                ):
                     await page.wait_for_timeout(800)
                     sso = await _read_sso_cookie(context)
                     if sso:
@@ -448,7 +748,13 @@ async def _login_async(
             sso = await _read_sso_cookie(context)
             if sso:
                 return sso
-            raise RuntimeError("登录超时：未拿到 SSO cookie")
+            # 最后诊断
+            try:
+                title = await page.title()
+                _log(log, f"[relogin] 超时诊断 title={title!r} url={page.url}")
+            except Exception:
+                pass
+            raise RuntimeError("登录超时：未拿到 SSO cookie（可能 Cloudflare 未通过）")
         finally:
             await browser.close()
 
