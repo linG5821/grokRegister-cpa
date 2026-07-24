@@ -288,21 +288,28 @@ class ExtractNextActionTests(unittest.TestCase):
                     return FakeResponse(
                         url,
                         payload={
-                            "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/auth",
+                            "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/code",
                             "token_endpoint": "https://auth.x.ai/oauth2/token",
                         },
                     )
-                return FakeResponse("https://accounts.x.ai/")
+                # verification_uri_complete GET
+                return FakeResponse(url if "oauth2/device" in url else "https://accounts.x.ai/")
 
             def post(self, url, **kwargs):
                 self.posts.append(url)
-                if url.endswith("/oauth2/device/auth") or "device/auth" in url or url.endswith("/device_authorization"):
+                if (
+                    url.endswith("/oauth2/device/code")
+                    or url.endswith("/oauth2/device/auth")
+                    or "device/auth" in url
+                    or url.endswith("/device_authorization")
+                ):
                     return FakeResponse(
                         url,
                         payload={
                             "device_code": "dev-code",
                             "user_code": "ABCD-EFGH",
                             "verification_uri": "https://accounts.x.ai/oauth2/device",
+                            "verification_uri_complete": "https://accounts.x.ai/oauth2/device?user_code=ABCD-EFGH",
                             "expires_in": 600,
                             "interval": 1,
                         },
@@ -339,10 +346,17 @@ class ExtractNextActionTests(unittest.TestCase):
         self.assertIsNotNone(token)
         self.assertEqual(token.get("access_token"), "not-a-jwt")
         self.assertEqual(token.get("refresh_token"), "rt")
-        self.assertTrue(any("device/auth" in u or "device_authorization" in u for u in session.posts))
+        self.assertTrue(
+            any(
+                "device/code" in u or "device/auth" in u or "device_authorization" in u
+                for u in session.posts
+            )
+        )
         self.assertTrue(any("device/verify" in u for u in session.posts))
         self.assertTrue(any("device/approve" in u for u in session.posts))
         self.assertTrue(any("/oauth2/token" in u for u in session.posts))
+        # 应先打开 verification_uri_complete
+        self.assertTrue(any("oauth2/device" in u for u in session.gets))
         # Device flow must not inject referrer authorize params
         self.assertNotIn("referrer=grok-build", " ".join(session.posts))
 

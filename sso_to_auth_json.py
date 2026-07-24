@@ -384,154 +384,299 @@ def sso_to_token(
         verification_complete = f"{base}{sep}user_code={urllib.parse.quote(user_code)}"
     log(f"  [*] user_code={user_code} interval={interval}s")
 
-    # confirm: verify + approve（纯 HTTP，SSO cookie）
-    cookie_hdr = f"sso={sso_cookie}"
-    verify_headers = {
-        "User-Agent": BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Origin": "https://accounts.x.ai",
-        "Referer": verification_complete,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Cookie": cookie_hdr,
-    }
-    try:
-        r = s.post(
-            DEVICE_VERIFY_URL,
-            data=urllib.parse.urlencode({"user_code": user_code}),
-            headers=verify_headers,
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=False,
-        )
-    except Exception as e:
-        log(f"  ❌ device verify 异常: {e}")
-        return None
-    if _cancelled():
-        return None
-    loc = str(r.headers.get("Location") or "")
-    loc_err = _device_location_error(loc)
-    if loc_err:
-        log(f"  ❌ device verify error={loc_err}")
-        return None
-    if r.status_code == 403:
-        log("  ❌ device verify challenge/403")
-        return None
-    if "/oauth2/device/done" not in loc:
-        consent_ref = loc
+    # confirm: 对齐 grok-register/build_sso_convert
+    # 1) GET verification_uri_complete（建立设备确认会话）
+    # 2) POST verify  3) POST approve（严格判定，禁止把任意 2xx 当成功）
+    # 4) poll token（invalid_grant 时整轮重试 1 次）
+    cookie_hdr = f"sso={sso_cookie}; sso-rw={sso_cookie}"
+
+    def _browser_form_headers(referer: str) -> dict:
+        ref = referer or verification_complete or "https://auth.x.ai/"
+        origin = "https://auth.x.ai"
+        try:
+            p = urllib.parse.urlparse(ref)
+            if p.scheme and p.netloc:
+                origin = f"{p.scheme}://{p.netloc}"
+        except Exception:
+            pass
+        return {
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": origin,
+            "Referer": ref,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": cookie_hdr,
+        }
+
+    def _abs_accounts_url(loc: str) -> str:
+        loc = str(loc or "").strip()
+        if not loc:
+            return ""
+        if loc.startswith("/"):
+            # device 确认页在 auth.x.ai 与 accounts.x.ai 都可能出现
+            if loc.startswith("/oauth2/"):
+                return "https://auth.x.ai" + loc
+            return "https://accounts.x.ai" + loc
+        return loc
+
+    def _authorize_device() -> bool:
+        """verify+approve；True=服务端侧设备确认成功（非假阳性）。"""
+        # Step: open verification_uri_complete with SSO
+        try:
+            s.get(
+                verification_complete,
+                headers={
+                    "User-Agent": BROWSER_UA,
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Cookie": cookie_hdr,
+                },
+                impersonate="chrome",
+                timeout=20,
+                allow_redirects=True,
+            )
+        except Exception as e:
+            log(f"  ⚠️ open verification uri: {e}")
+
+        if _cancelled():
+            return False
+
+        try:
+            r = s.post(
+                DEVICE_VERIFY_URL,
+                data=urllib.parse.urlencode({"user_code": user_code}),
+                headers=_browser_form_headers(verification_complete),
+                impersonate="chrome",
+                timeout=20,
+                allow_redirects=False,
+            )
+        except Exception as e:
+            log(f"  ❌ device verify 异常: {e}")
+            return False
+        if _cancelled():
+            return False
+
+        loc = str(r.headers.get("Location") or "")
+        loc_err = _device_location_error(loc)
+        if loc_err:
+            log(f"  ❌ device verify error={loc_err} status={r.status_code}")
+            return False
+        if r.status_code == 401:
+            log("  ❌ device verify 401（SSO 被拒）")
+            return False
+        if r.status_code == 403:
+            log("  ❌ device verify challenge/403")
+            return False
+        # 已直接 done
+        if "/oauth2/device/done" in loc or (
+            r.status_code in (200, 204)
+            and (
+                "device authorized" in str(r.text or "").lower()
+                or "设备已授权" in str(r.text or "")
+            )
+        ):
+            log(f"  ✅ 设备已授权 (verify status={r.status_code})")
+            return True
+
+        # 需要 approve
+        consent_ref = _abs_accounts_url(loc)
         if not consent_ref:
             consent_ref = (
-                "https://accounts.x.ai/oauth2/device/consent?"
+                "https://auth.x.ai/oauth2/device/consent?"
                 f"user_code={urllib.parse.quote(user_code)}"
             )
-        elif consent_ref.startswith("/"):
-            consent_ref = "https://accounts.x.ai" + consent_ref
-        approve_headers = dict(verify_headers)
-        approve_headers["Referer"] = consent_ref
         try:
             r2 = s.post(
                 DEVICE_APPROVE_URL,
-                data=urllib.parse.urlencode({
-                    "user_code": user_code,
-                    "action": "allow",
-                    "principal_type": "User",
-                    "principal_id": "",
-                }),
-                headers=approve_headers,
+                data=urllib.parse.urlencode(
+                    {
+                        "user_code": user_code,
+                        "action": "allow",
+                        "principal_type": "User",
+                        "principal_id": "",
+                    }
+                ),
+                headers=_browser_form_headers(consent_ref),
                 impersonate="chrome",
-                timeout=15,
+                timeout=20,
                 allow_redirects=False,
             )
         except Exception as e:
             log(f"  ❌ device approve 异常: {e}")
-            return None
+            return False
         if _cancelled():
-            return None
+            return False
+
         aloc = str(r2.headers.get("Location") or "")
         aerr = _device_location_error(aloc)
         if aerr:
-            log(f"  ❌ device approve error={aerr}")
-            return None
-        body_l = str(r2.text or "").lower()
-        ok = (
-            "device authorized" in body_l
-            or "设备已授权" in (r2.text or "")
-            or r2.status_code // 100 == 2
-            or "device/done" in aloc
-            or (aloc and not aerr)
-        )
-        if not ok:
-            if r2.status_code == 403:
-                log("  ❌ device approve challenge/403")
-            else:
-                log(f"  ❌ device approve 未知响应 status={r2.status_code}")
-            return None
-    log("  ✅ 设备已授权")
+            log(f"  ❌ device approve error={aerr} status={r2.status_code}")
+            return False
+        if r2.status_code == 401:
+            log("  ❌ device approve 401（SSO 被拒）")
+            return False
+        if r2.status_code == 403:
+            log("  ❌ device approve challenge/403")
+            return False
 
-    # poll token
-    deadline = time.time() + max(expires_in, 60)
-    poll_interval = interval
-    last_err = ""
-    while time.time() < deadline:
-        if _cancelled():
-            return None
-        try:
-            tr = s.post(
-                token_ep,
-                data=urllib.parse.urlencode({
-                    "client_id": CLIENT_ID,
-                    "device_code": device_code,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                }),
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": BROWSER_UA,
-                    "Accept": "application/json",
-                },
-                impersonate="chrome",
-                timeout=15,
-            )
-        except Exception as e:
-            last_err = f"token poll 异常: {e}"
-            log(f"  ⚠️ {last_err}")
-            time.sleep(poll_interval)
-            continue
-        try:
-            doc = tr.json()
-        except Exception:
-            last_err = f"token 非 JSON status={tr.status_code}"
-            time.sleep(poll_interval)
-            continue
-        if tr.status_code // 100 == 2 and doc.get("access_token"):
-            token = doc
-            if not token.get("expires_in"):
-                token["expires_in"] = 21600
-            if not token.get("token_type"):
-                token["token_type"] = "Bearer"
-            ap = decode_jwt_payload(token["access_token"])
+        body_l = str(r2.text or "").lower()
+        body_raw = str(r2.text or "")
+        al = aloc.lower()
+        # 严格成功条件（旧逻辑把任意 2xx / 任意 Location 当成功 → 假阳性 → invalid_grant）
+        ok = False
+        if "device authorized" in body_l or "设备已授权" in body_raw:
+            ok = True
+        elif "device/done" in al:
+            ok = True
+        elif r2.status_code in (302, 303, 307, 308):
+            # 仅 done / authorized 跳转算成功；仍停在 consent/sign-in = 未批准
+            if "error=" in al or any(
+                x in al for x in ("sign-in", "signin", "/login", "consent")
+            ):
+                ok = False
+            elif al and "oauth2/device" in al:
+                # 跳到其它 device 成功页（非 consent）
+                ok = "consent" not in al and "error" not in al
+        elif r2.status_code in (200, 204) and "authorized" in body_l:
+            ok = True
+        if not ok:
             log(
-                f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
-                f" scope={ap.get('scope')!r} referrer={ap.get('referrer')!r}"
-                f" bot={ap.get('bot_flag_source')!r}"
-                + (" + refresh_token" if token.get("refresh_token") else "")
+                f"  ❌ device approve 未确认授权 status={r2.status_code} "
+                f"loc={(aloc or '')[:120]} body={(body_raw or '')[:80]!r}"
             )
-            return token
-        err = str(doc.get("error") or "")
-        if err == "authorization_pending":
-            time.sleep(poll_interval)
-            continue
-        if err == "slow_down":
-            poll_interval += 1
-            time.sleep(poll_interval)
-            continue
-        if err in ("access_denied", "expired_token"):
-            log(f"  ❌ token poll {err}")
+            return False
+        log(f"  ✅ 设备已授权 (approve status={r2.status_code})")
+        return True
+
+    def _poll_token() -> dict | None:
+        # approve 成功后 token 应很快可用；对齐 chenyme min(expires_in, 75s)
+        deadline = time.time() + min(max(int(expires_in), 30), 75)
+        poll_interval = max(float(interval), 1.0)
+        last_err = ""
+        while time.time() < deadline:
+            if _cancelled():
+                return None
+            try:
+                tr = s.post(
+                    token_ep,
+                    data=urllib.parse.urlencode(
+                        {
+                            "client_id": CLIENT_ID,
+                            "device_code": device_code,
+                            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                        }
+                    ),
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": BROWSER_UA,
+                        "Accept": "application/json",
+                    },
+                    impersonate="chrome",
+                    timeout=15,
+                )
+            except Exception as e:
+                last_err = f"token poll 异常: {e}"
+                log(f"  ⚠️ {last_err}")
+                time.sleep(poll_interval)
+                continue
+            try:
+                doc = tr.json()
+            except Exception:
+                last_err = f"token 非 JSON status={tr.status_code} body={str(tr.text)[:120]}"
+                time.sleep(poll_interval)
+                continue
+            if tr.status_code // 100 == 2 and doc.get("access_token"):
+                token = doc
+                if not token.get("expires_in"):
+                    token["expires_in"] = 21600
+                if not token.get("token_type"):
+                    token["token_type"] = "Bearer"
+                ap = decode_jwt_payload(token["access_token"])
+                log(
+                    f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+                    f" scope={ap.get('scope')!r} referrer={ap.get('referrer')!r}"
+                    f" bot={ap.get('bot_flag_source')!r}"
+                    + (" + refresh_token" if token.get("refresh_token") else "")
+                )
+                return token
+            err = str(doc.get("error") or "")
+            desc = str(doc.get("error_description") or "")
+            if err == "authorization_pending":
+                time.sleep(poll_interval)
+                continue
+            if err == "slow_down":
+                poll_interval = min(poll_interval + 1, 15)
+                time.sleep(poll_interval)
+                continue
+            if err in ("access_denied", "expired_token", "invalid_grant"):
+                last_err = f"{err}" + (f": {desc}" if desc else "")
+                log(f"  ❌ token poll {last_err}")
+                return None
+            last_err = err or f"status={tr.status_code} body={str(doc)[:120]}"
+            log(f"  ❌ token poll 失败: {last_err}")
             return None
-        last_err = err or f"status={tr.status_code}"
-        log(f"  ❌ token poll 失败: {last_err}")
+        log(f"  ❌ token poll 超时: {last_err}")
         return None
 
-    log(f"  ❌ token poll 超时: {last_err}")
+    # 整轮最多 2 次（approve 假成功 / 竞态时重申 device code 无意义，只重做 confirm+poll）
+    # 若 authorize 失败则直接失败；若 poll invalid_grant 则重新 device auth 一轮
+    for attempt in range(1, 3):
+        if attempt > 1:
+            log(f"  ↻ Device Flow 整轮重试 {attempt}/2 ...")
+            try:
+                r = s.post(
+                    device_ep,
+                    data=urllib.parse.urlencode(
+                        {
+                            "client_id": CLIENT_ID,
+                            "scope": SCOPES,
+                        }
+                    ),
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": BROWSER_UA,
+                        "Accept": "application/json",
+                    },
+                    impersonate="chrome",
+                    timeout=15,
+                )
+                device_doc = r.json()
+                device_code = str(device_doc.get("device_code") or "").strip()
+                user_code = str(device_doc.get("user_code") or "").strip()
+                verification_uri = str(
+                    device_doc.get("verification_uri")
+                    or device_doc.get("verification_url")
+                    or ""
+                ).strip()
+                verification_complete = str(
+                    device_doc.get("verification_uri_complete") or ""
+                ).strip()
+                expires_in = int(device_doc.get("expires_in") or 600)
+                interval = float(device_doc.get("interval") or 5)
+                if not verification_complete:
+                    base = verification_uri or "https://accounts.x.ai/oauth2/device"
+                    sep = "&" if "?" in base else "?"
+                    verification_complete = (
+                        f"{base}{sep}user_code={urllib.parse.quote(user_code)}"
+                    )
+                if not device_code or not user_code:
+                    log("  ❌ 重试时 device authorization 缺字段")
+                    return None
+                log(f"  [*] user_code={user_code} (retry)")
+            except Exception as e:
+                log(f"  ❌ 重试 device authorization 失败: {e}")
+                return None
+
+        if not _authorize_device():
+            return None
+        token = _poll_token()
+        if token:
+            return token
+        # invalid_grant / 超时 → 再试一轮
+        if attempt >= 2:
+            break
+        time.sleep(1.0)
+
     return None
 
 
