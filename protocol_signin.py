@@ -96,6 +96,68 @@ def probe_sso_alive(sso: str, proxy: str = "", timeout: float = 20) -> bool:
         return False
 
 
+async def _hide_browser_windows(browser, log: LogFn = None) -> None:
+    """与注册 browser_session 一致：Windows 下最小化/移出屏幕/隐藏；其它平台仅启动参数屏外。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # Playwright 不直接暴露 root pid；用 CDP / 进程树不可靠时枚举标题含 Chromium/Chrome 的新窗
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        SW_MINIMIZE = 6
+        SW_HIDE = 0
+        flags_move = 0x0010 | 0x4000  # SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+        flags_bottom = 0x0001 | 0x0002 | 0x0010 | 0x4000
+        browser_hwnds: list[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+                    # 仍收集可能刚创建的
+                    pass
+                length = user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = (buf.value or "").lower()
+                # 重登窗口标题通常含 Sign In / x.ai / Chrome
+                if any(
+                    k in title
+                    for k in (
+                        "sign in",
+                        "x.ai",
+                        "spacexai",
+                        "accounts.x.ai",
+                        "chrome",
+                        "chromium",
+                    )
+                ):
+                    browser_hwnds.append(int(hwnd))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        moved = 0
+        for hwnd in browser_hwnds:
+            try:
+                user32.ShowWindow(hwnd, SW_MINIMIZE)
+                user32.SetWindowPos(
+                    hwnd, wintypes.HWND(1), -32000, -32000, 1, 1, flags_move
+                )
+                user32.SetWindowPos(hwnd, wintypes.HWND(1), 0, 0, 0, 0, flags_bottom)
+                user32.ShowWindow(hwnd, SW_HIDE)
+                moved += 1
+            except Exception:
+                pass
+        if moved and log:
+            _log(log, f"[relogin] 已隐藏浏览器窗口数={moved}")
+    except Exception as exc:
+        _log(log, f"[relogin] 隐藏窗口失败(忽略): {exc}")
+
+
 def _find_chrome() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
     mint = os.path.join(root, "scripts", "turnstile_mint.py")
@@ -127,63 +189,125 @@ def _find_chrome() -> str:
 
 
 async def _click_continue_with_email(page, log: LogFn = None) -> bool:
-    """sign-in 首页必须先点 Login with email，才会出现邮箱框。"""
+    """sign-in 首页必须先点 Login with email，才会出现邮箱框。
+
+    页面文案为英文 "Login with email"（data-testid=continue-with-email）。
+    屏外/最小化时 is_visible 常为 false，必须 force / JS 点击。
+    """
     selectors = [
         '[data-testid="continue-with-email"]',
+        'button[data-testid="continue-with-email"]',
         'button:has-text("Login with email")',
+        'button:has-text("Log in with email")',
         'button:has-text("Continue with email")',
         'button:has-text("Sign in with email")',
+        'button:has-text("Login with Email")',
         'button:has-text("使用邮箱")',
         'button:has-text("邮箱登录")',
         'a:has-text("Login with email")',
+        'a:has-text("Log in with email")',
     ]
     for sel in selectors:
         try:
             loc = page.locator(sel).first
             if await loc.count() == 0:
                 continue
-            if not await loc.is_visible():
-                continue
-            await loc.click(timeout=5000)
+            # 屏外窗口不要依赖 is_visible
+            try:
+                await loc.click(timeout=5000, force=True)
+            except Exception:
+                await loc.evaluate("el => el.click()")
             _log(log, f"[relogin] 已点邮箱入口: {sel}")
             await page.wait_for_timeout(1200)
             return True
         except Exception:
             continue
-    # role + name 兜底
+    # role + name（含 Login with / Log in with）
     for name in (
         r"Login with email",
+        r"Log in with email",
         r"Continue with email",
         r"Sign in with email",
+        r"Login with Email",
         r"使用邮箱",
         r"邮箱登录",
-        r"Email",
+        r"Login with",
+        r"Log in with",
     ):
         try:
             btn = page.get_by_role("button", name=re.compile(name, re.I))
             if await btn.count():
-                await btn.first.click(timeout=4000)
+                try:
+                    await btn.first.click(timeout=4000, force=True)
+                except Exception:
+                    await btn.first.evaluate("el => el.click()")
                 _log(log, f"[relogin] 已点邮箱入口(role): {name}")
                 await page.wait_for_timeout(1200)
                 return True
         except Exception:
             pass
+    # JS 兜底：按文案模糊匹配（Login with email / Log in with email 等）
+    try:
+        clicked = await page.evaluate(
+            """() => {
+              const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const nodes = Array.from(document.querySelectorAll(
+                'button, a, [role="button"], [data-testid="continue-with-email"]'
+              ));
+              const prefer = document.querySelector('[data-testid="continue-with-email"]');
+              if (prefer) { prefer.click(); return 'testid'; }
+              for (const n of nodes) {
+                const t = norm(n.innerText || n.textContent || n.getAttribute('aria-label'));
+                if (!t) continue;
+                if (
+                  t.includes('login with email') ||
+                  t.includes('log in with email') ||
+                  t.includes('continue with email') ||
+                  t.includes('sign in with email') ||
+                  t.includes('使用邮箱') ||
+                  t.includes('邮箱登录') ||
+                  (t.includes('login with') && t.includes('email')) ||
+                  (t.includes('log in with') && t.includes('email'))
+                ) {
+                  n.click();
+                  return t.slice(0, 60);
+                }
+              }
+              return '';
+            }"""
+        )
+        if clicked:
+            _log(log, f"[relogin] 已点邮箱入口(js): {clicked}")
+            await page.wait_for_timeout(1200)
+            return True
+    except Exception:
+        pass
     return False
 
 
 async def _fill_by_selectors(page, selectors: list[str], value: str) -> bool:
-    """优先 Playwright fill；失败则用 JS 写 React 受控输入。"""
+    """优先 Playwright fill；失败则用 JS 写 React 受控输入。
+
+    屏外窗口下 is_visible 常 false，不依赖可见性。
+    """
     for sel in selectors:
         try:
             loc = page.locator(sel).first
             if await loc.count() == 0:
                 continue
-            if not await loc.is_visible():
+            try:
+                await loc.click(timeout=4000, force=True)
+            except Exception:
+                pass
+            try:
+                await loc.fill("", timeout=3000)
+            except Exception:
+                pass
+            try:
+                await loc.fill(value, timeout=5000)
+            except Exception:
+                # 屏外时 fill 可能因不可见失败，交给 JS 兜底
                 continue
-            await loc.click(timeout=4000)
-            await loc.fill("", timeout=3000)
-            await loc.fill(value, timeout=5000)
-            # 校验是否写进去
             got = await loc.input_value()
             if (got or "").strip() == value:
                 return True
@@ -482,13 +606,17 @@ async def _login_async(
     elif env_headless in ("0", "false", "no", "off"):
         headless = False
 
-    # 过 CF 时屏外窗口常失败；默认可见小窗（可用 env 强制屏外）
-    offscreen = (os.environ.get("GROK_RELOGIN_OFFSCREEN") or "").strip().lower() in (
+    # 与注册一致：默认屏外+最小化（用户点不出来）；GROK_RELOGIN_VISIBLE=1 才弹窗
+    visible = (os.environ.get("GROK_RELOGIN_VISIBLE") or "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
+    # 兼容旧 env：OFFSCREEN=0 也表示可见
+    env_off = (os.environ.get("GROK_RELOGIN_OFFSCREEN") or "").strip().lower()
+    if env_off in ("0", "false", "no", "off"):
+        visible = True
 
     args = [
         "--no-sandbox",
@@ -499,7 +627,8 @@ async def _login_async(
         "--disable-infobars",
         "--window-size=1000,800",
     ]
-    if not headless and offscreen:
+    if not headless and not visible:
+        # 同 browser_session / turnstile_mint：有界面内核过 CF，但启动即屏外
         args.extend(
             [
                 "--window-position=-32000,-32000",
@@ -523,7 +652,7 @@ async def _login_async(
 
     _log(
         log,
-        f"[relogin] 打开登录页 chrome={chrome} headless={headless} offscreen={offscreen}",
+        f"[relogin] 打开登录页 chrome={chrome} headless={headless} visible={visible}",
     )
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**launch)
@@ -540,8 +669,12 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
                 """
             )
             page = await context.new_page()
+            if not headless and not visible:
+                await _hide_browser_windows(browser, log=log)
             await page.goto(SIGNIN_URL, timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(1200)
+            if not headless and not visible:
+                await _hide_browser_windows(browser, log=log)
 
             # 0) 整页 CF 挑战（Just a moment）— 不过就没有 Login with email
             try:

@@ -26,6 +26,8 @@ class ProtocolSigninHelpers(unittest.TestCase):
         self.assertTrue(callable(psi._click_turnstile_widget))
         self.assertTrue(callable(psi._wait_cf_and_turnstile))
         self.assertTrue(callable(psi._read_turnstile_token))
+        self.assertTrue(callable(psi._click_continue_with_email))
+        self.assertTrue(callable(psi._hide_browser_windows))
 
 
 if __name__ == "__main__":
