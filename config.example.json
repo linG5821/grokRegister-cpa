@@ -36,7 +36,7 @@
   "sso_relogin_out_dir": "relogin_accounts",
   "sso_relogin_only_dead": true,
   "sso_relogin_auto_device_flow": true,
-  "sso_relogin_workers": 1,
+  "sso_relogin_workers": 2,
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
   "yyds_api_key": "",

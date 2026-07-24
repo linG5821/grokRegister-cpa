@@ -104,10 +104,11 @@ def run_sso_relogin(
     if total == 0:
         return {"total": 0, "ok": 0, "skip_alive": 0, "fail": 0, "device_ok": 0}
 
-    workers = max(1, min(int(workers or 1), 4))
+    workers = max(1, min(int(workers or 1), 8))
     lock = threading.Lock()
     stats = {"ok": 0, "skip_alive": 0, "fail": 0, "device_ok": 0, "stopped": False}
     success_lines: list[str] = []
+    _log(log, f"[relogin] 并发 workers={workers}（每 worker 独立 Chrome）")
 
     def _append_fail(email: str, reason: str) -> None:
         line = f"{email}----{reason}----{int(time.time())}\n"

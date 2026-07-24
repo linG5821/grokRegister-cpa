@@ -2434,6 +2434,18 @@ class GrokRegisterGUI:
             1,
             columnspan=3,
         )
+        g_label(10, 0, "说明:")
+        g_field(
+            tk_label(
+                self.g2a_frame,
+                text="重登并发=上方「并发数」（每 worker 开一个 Chrome，建议 2–4）",
+                bg=UI_PANEL_BG,
+            ),
+            10,
+            1,
+            columnspan=3,
+            sticky=tk.W,
+        )
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
@@ -2806,10 +2818,16 @@ class GrokRegisterGUI:
                         or "exports/grok2api_build_import.json"
                     ).strip() or "exports/grok2api_build_import.json"
                 try:
-                    workers = int(config.get("sso_relogin_workers", 1) or 1)
+                    workers = int(self.workers_var.get() or 1)
                 except Exception:
-                    workers = 1
-                workers = max(1, min(workers, 4))
+                    try:
+                        workers = int(config.get("sso_relogin_workers", 1) or 1)
+                    except Exception:
+                        workers = 1
+                workers = max(1, min(workers, 8))
+                config["sso_relogin_workers"] = workers
+                config["register_workers"] = workers
+                self.log(f"[重登] 并发 workers={workers}")
                 result = _relogin.run_sso_relogin(
                     scan_dir=APP_DIR,
                     out_dir=out_dir,
