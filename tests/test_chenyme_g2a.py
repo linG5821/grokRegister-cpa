@@ -23,18 +23,60 @@ class BuildImportEntryTests(unittest.TestCase):
         self.assertNotIn("team_id", entry)
         self.assertEqual(entry["email"], "a@x.com")
 
-    def test_append_dedup(self):
+    def test_append_dedup_by_email(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "imp.json")
             e1 = {"provider": "grok_build", "email": "a@x.com", "name": "a@x.com",
-                  "access_token": "a1", "refresh_token": "r1"}
+                  "access_token": "a1", "refresh_token": "r1", "user_id": "u1"}
             e2 = dict(e1)
             e2["access_token"] = "a2"
+            e2["refresh_token"] = "r2"
             gbi.append_build_import(path, e1)
             gbi.append_build_import(path, e2)
-            data = json.load(open(path, encoding="utf-8"))
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
             self.assertEqual(len(data["accounts"]), 1)
             self.assertEqual(data["accounts"][0]["access_token"], "a2")
+            self.assertEqual(data["accounts"][0]["refresh_token"], "r2")
+
+    def test_rebuild_from_cpa_dir_is_full_latest(self):
+        with tempfile.TemporaryDirectory() as d:
+            auth = os.path.join(d, "auth")
+            os.makedirs(auth)
+            # two cpa files
+            for email, at, rt in (
+                ("a@x.com", "aa", "ra"),
+                ("b@x.com", "bb", "rb"),
+            ):
+                with open(os.path.join(auth, f"xai-{email}.json"), "w", encoding="utf-8") as f:
+                    json.dump({
+                        "email": email, "access_token": at, "refresh_token": rt,
+                        "sub": f"sub-{email}", "expires_in": 100,
+                    }, f)
+            # stale import with old token for a@ + orphan c@
+            imp = os.path.join(d, "exports", "imp.json")
+            os.makedirs(os.path.dirname(imp), exist_ok=True)
+            with open(imp, "w", encoding="utf-8") as f:
+                json.dump({"accounts": [
+                    {"provider": "grok_build", "email": "a@x.com", "access_token": "OLD",
+                     "refresh_token": "OLD_R", "name": "a@x.com"},
+                    {"provider": "grok_build", "email": "c@x.com", "access_token": "cc",
+                     "refresh_token": "rc", "name": "c@x.com"},
+                ]}, f)
+            path, n = gbi.rebuild_import_from_cpa_dir(auth, imp)
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            by_email = {a["email"]: a for a in data["accounts"]}
+            # a 被 CPA 最新覆盖
+            self.assertEqual(by_email["a@x.com"]["access_token"], "aa")
+            # b 从 CPA 补入
+            self.assertEqual(by_email["b@x.com"]["access_token"], "bb")
+            # c 不在 CPA 目录但原文件有 → 保留
+            self.assertEqual(by_email["c@x.com"]["access_token"], "cc")
+            self.assertEqual(n, 3)
+            # 无重复 email
+            emails = [a["email"] for a in data["accounts"]]
+            self.assertEqual(len(emails), len(set(emails)))
 
 
 class ChenymeImportTests(unittest.TestCase):

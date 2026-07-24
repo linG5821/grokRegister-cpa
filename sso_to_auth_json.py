@@ -991,6 +991,7 @@ def convert_sso_entries(
     cpa_auth_dir: str | None = None,
     cpa_remote_url: str | None = None,
     cpa_management_key: str | None = None,
+    g2a_build_import_file: str | None = None,
     proxy: str = "",
     delay: int = 0,
     fallback_email: str = "",
@@ -1083,22 +1084,36 @@ def convert_sso_entries(
                         out_msg = f"💾 {out}"
                 _log(out_msg, worker_id)
 
-            if cpa_auth_dir or cpa_remote_url:
-                record = token_to_cpa_record(token, email=email, sso=sso)
-                if cpa_auth_dir:
-                    with lock:
-                        path = write_cpa_auth(Path(cpa_auth_dir), record)
-                    _log(f"💾 CPA 本地 → {path}", worker_id)
-                if cpa_remote_url:
-                    name = upload_cpa_auth_remote(
-                        cpa_remote_url,
-                        str(cpa_management_key or ""),
-                        record,
-                    )
-                    _log(
-                        f"💾 CPA 远程 → {cpa_remote_url.rstrip('/')}/.../{name}",
-                        worker_id,
-                    )
+            cpa_record = None
+            if cpa_auth_dir or cpa_remote_url or g2a_build_import_file:
+                cpa_record = token_to_cpa_record(token, email=email, sso=sso)
+            if cpa_record and cpa_auth_dir:
+                with lock:
+                    path = write_cpa_auth(Path(cpa_auth_dir), cpa_record)
+                _log(f"💾 CPA 本地 → {path}", worker_id)
+            if cpa_record and cpa_remote_url:
+                name = upload_cpa_auth_remote(
+                    cpa_remote_url,
+                    str(cpa_management_key or ""),
+                    cpa_record,
+                )
+                _log(
+                    f"💾 CPA 远程 → {cpa_remote_url.rstrip('/')}/.../{name}",
+                    worker_id,
+                )
+            # 仅本地累加 Build 导入 JSON（按 email 覆盖；远程 grok2api 手动 import）
+            # 全量最新快照会在 convert 结束后用 CPA 目录 rebuild
+            if cpa_record and g2a_build_import_file:
+                try:
+                    from g2a_build_import import append_build_import, build_import_entry
+
+                    entry_g2a = build_import_entry(cpa_record)
+                    if entry_g2a.get("access_token") and entry_g2a.get("refresh_token"):
+                        # append_build_import 内部自带锁；勿再套 convert 的 lock 以免死锁
+                        out_path = append_build_import(g2a_build_import_file, entry_g2a, log=None)
+                        _log(f"💾 g2a 本地(按邮箱覆盖) → {out_path}", worker_id)
+                except Exception as g2a_exc:
+                    _log(f"⚠️ g2a 本地导入文件写入失败: {g2a_exc}", worker_id)
 
             with lock:
                 stats["ok"] += 1
@@ -1144,6 +1159,21 @@ def convert_sso_entries(
             ]
             for fut in as_completed(futures):
                 fut.result()
+
+    # 补转结束后：若开启 g2a 文件且有 CPA 本地目录，按 email 全量重建导入文件
+    # 保证文件始终是「当前 CPA auth 目录下全部最新号」+ 去重
+    if g2a_build_import_file and cpa_auth_dir:
+        try:
+            from g2a_build_import import rebuild_import_from_cpa_dir
+
+            out_path, n = rebuild_import_from_cpa_dir(
+                cpa_auth_dir,
+                g2a_build_import_file,
+                log=lambda m: log(str(m)),
+            )
+            log(f"📦 g2a 全量同步完成: {out_path} ({n} 个账号，按邮箱去重)")
+        except Exception as rebuild_exc:
+            log(f"⚠️ g2a 全量同步失败: {rebuild_exc}")
 
     result = {
         "total": total,

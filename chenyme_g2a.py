@@ -277,11 +277,21 @@ def maybe_export_build_after_cpa(
 
     if config.get("g2a_build_import_file_enabled"):
         try:
-            from g2a_build_import import DEFAULT_IMPORT_FILE, append_build_import, resolve_import_path
+            from g2a_build_import import (
+                DEFAULT_IMPORT_FILE,
+                append_build_import,
+                rebuild_import_from_cpa_dir,
+            )
 
-            path = resolve_import_path(config.get("g2a_build_import_file") or DEFAULT_IMPORT_FILE)
-            append_build_import(path, entry, log=log)
-            _log(log, f"[g2a] 已更新本地导入文件 {path}")
+            file_cfg = config.get("g2a_build_import_file") or DEFAULT_IMPORT_FILE
+            auth_dir = str(config.get("cpa_auth_dir") or "").strip()
+            if auth_dir:
+                # 有 CPA 目录：以目录为权威源全量同步（按邮箱去重，保证文件=全部最新）
+                path, n = rebuild_import_from_cpa_dir(auth_dir, file_cfg, log=log)
+                _log(log, f"[g2a] 本地导入文件已全量同步 {path}（{n} 个账号）")
+            else:
+                path = append_build_import(file_cfg, entry, log=log)
+                _log(log, f"[g2a] 已按邮箱更新本地导入文件 {path}")
         except Exception as exc:
             _log(log, f"[!] 写本地 Build 导入文件失败: {exc}")
 

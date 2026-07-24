@@ -149,10 +149,81 @@ def _atomic_write(path: str, accounts: list[dict]) -> None:
                 pass
 
 
-def append_build_import(file_path: str, entry: dict, log: LogFn = None) -> None:
-    """累加写入；同 email 覆盖。路径默认 exports/ 下，相对路径相对项目根。"""
+def _entry_email_key(entry: dict) -> str:
+    return str((entry or {}).get("email") or (entry or {}).get("name") or "").strip().lower()
+
+
+def _entry_user_key(entry: dict) -> str:
+    return str(
+        (entry or {}).get("user_id")
+        or (entry or {}).get("principal_id")
+        or ""
+    ).strip().lower()
+
+
+def _upsert_by_identity(accounts: list[dict], entry: dict) -> list[dict]:
+    """按 email 优先、否则 user_id 去重；命中则覆盖为最新 entry。"""
+    email = _entry_email_key(entry)
+    uid = _entry_user_key(entry)
+    out: list[dict] = []
+    replaced = False
+    for acc in accounts:
+        acc_email = _entry_email_key(acc)
+        acc_uid = _entry_user_key(acc)
+        same = False
+        if email and acc_email and email == acc_email:
+            same = True
+        elif (not email or not acc_email) and uid and acc_uid and uid == acc_uid:
+            same = True
+        if same:
+            if not replaced:
+                out.append(entry)
+                replaced = True
+            # 丢弃后续重复旧条
+            continue
+        out.append(acc)
+    if not replaced:
+        out.append(entry)
+    return out
+
+
+def _dedupe_accounts(accounts: list[dict]) -> list[dict]:
+    """全量去重：同 email / 同 user_id 只保留最后一条（后写覆盖先写）。"""
+    # 从后往前扫，先遇到的是更新版本
+    kept_rev: list[dict] = []
+    seen_email: set[str] = set()
+    seen_uid: set[str] = set()
+    for acc in reversed(list(accounts or [])):
+        if not isinstance(acc, dict):
+            continue
+        if not str(acc.get("access_token") or "").strip() and not str(
+            acc.get("refresh_token") or ""
+        ).strip():
+            continue
+        email = _entry_email_key(acc)
+        uid = _entry_user_key(acc)
+        if email and email in seen_email:
+            continue
+        if uid and uid in seen_uid:
+            # 无 email 时用 uid；有 email 的条已按 email 去重
+            if not email:
+                continue
+        if email:
+            seen_email.add(email)
+        if uid:
+            seen_uid.add(uid)
+        kept_rev.append(acc)
+    kept_rev.reverse()
+    return kept_rev
+
+
+def append_build_import(file_path: str, entry: dict, log: LogFn = None) -> str:
+    """累加写入；同 email（或 user_id）覆盖。返回实际写入路径。"""
     path = resolve_import_path(file_path)
-    email = str((entry or {}).get("email") or (entry or {}).get("name") or "").strip().lower()
+    if not entry or not (
+        str(entry.get("access_token") or "").strip() or str(entry.get("refresh_token") or "").strip()
+    ):
+        return path
     with _write_lock:
         accounts, corrupted = _load_accounts(path)
         if corrupted:
@@ -163,14 +234,77 @@ def append_build_import(file_path: str, entry: dict, log: LogFn = None) -> None:
             except Exception as exc:
                 _log(log, f"[g2a] 导入文件损坏且备份失败: {exc}")
             accounts = []
-        replaced = False
-        if email:
-            for i, acc in enumerate(accounts):
-                existing = str(acc.get("email") or acc.get("name") or "").strip().lower()
-                if existing == email:
-                    accounts[i] = entry
-                    replaced = True
-                    break
-        if not replaced:
-            accounts.append(entry)
+        accounts = _upsert_by_identity(accounts, entry)
+        accounts = _dedupe_accounts(accounts)
         _atomic_write(path, accounts)
+    return path
+
+
+def rebuild_import_from_cpa_dir(
+    cpa_auth_dir: str,
+    import_file: str = "",
+    log: LogFn = None,
+) -> tuple[str, int]:
+    """从本地 CPA auth 目录全量重建导入文件（按 email 去重，保留全部最新号）。
+
+    返回 (path, account_count)。
+    """
+    auth_dir = str(cpa_auth_dir or "").strip()
+    path = resolve_import_path(import_file)
+    if not auth_dir or not os.path.isdir(auth_dir):
+        _log(log, f"[g2a] CPA auth 目录不存在，跳过全量重建: {auth_dir}")
+        return path, 0
+
+    entries: list[dict] = []
+    try:
+        names = sorted(os.listdir(auth_dir))
+    except OSError as exc:
+        _log(log, f"[g2a] 读取 CPA auth 目录失败: {exc}")
+        return path, 0
+
+    for name in names:
+        if not name.lower().endswith(".json"):
+            continue
+        # 常见 xai-*.json；也接受目录内其它 oauth json
+        fpath = os.path.join(auth_dir, name)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, "r", encoding="utf-8") as handle:
+                rec = json.load(handle)
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        # CPA 扁平记录：有 access/refresh；type 可选
+        if not str(rec.get("access_token") or "").strip() and not str(rec.get("refresh_token") or "").strip():
+            continue
+        try:
+            entry = build_import_entry(rec)
+        except Exception:
+            continue
+        if not entry.get("access_token") and not entry.get("refresh_token"):
+            continue
+        entries.append(entry)
+
+    with _write_lock:
+        # 与现有文件合并后再去重：CPA 目录为准覆盖同 email，文件中 CPA 没有的号保留
+        existing, corrupted = _load_accounts(path)
+        if corrupted:
+            bak = path + ".bak"
+            try:
+                shutil.copy2(path, bak)
+                _log(log, f"[g2a] 导入文件损坏，已备份 {bak}")
+            except Exception:
+                pass
+            existing = []
+        merged = list(existing)
+        for entry in entries:
+            merged = _upsert_by_identity(merged, entry)
+        merged = _dedupe_accounts(merged)
+        # 再按 email 排序，稳定输出
+        merged.sort(key=lambda a: (_entry_email_key(a) or _entry_user_key(a) or ""))
+        _atomic_write(path, merged)
+        n = len(merged)
+    _log(log, f"[g2a] 已从 CPA 目录全量同步导入文件 {path}（{n} 个账号）")
+    return path, n
