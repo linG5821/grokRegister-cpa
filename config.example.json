@@ -32,6 +32,7 @@
   "g2a_build_import_file_enabled": false,
   "g2a_build_import_file": "exports/grok2api_build_import.json",
   "g2a_build_remote_import_enabled": false,
+  "sso_force_reconvert": false,
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
   "yyds_api_key": "",

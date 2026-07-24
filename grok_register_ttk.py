@@ -173,6 +173,8 @@ DEFAULT_CONFIG = {
     "g2a_build_import_file": "exports/grok2api_build_import.json",
     # 远程 multipart accounts/import（每号一文件，字段名 file）
     "g2a_build_remote_import_enabled": False,
+    # 补转：强制重转已有 CPA 账号（token 过期时用；默认跳过已有）
+    "sso_force_reconvert": False,
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -2394,6 +2396,13 @@ class GrokRegisterGUI:
         g_label(5, 0, "本地 JSON:")
         g_field(tk_entry(self.g2a_frame, textvariable=self.g2a_import_file_var, width=40), 5, 1, columnspan=3)
 
+        self.sso_force_reconvert_var = tk.BooleanVar(value=bool(config.get("sso_force_reconvert", False)))
+        tk_checkbutton(
+            self.g2a_frame,
+            text="补转时强制重转（含已有 CPA；token 全过期时勾选，默认跳过已有）",
+            variable=self.sso_force_reconvert_var,
+        ).grid(row=6, column=0, columnspan=4, sticky=tk.W, pady=2)
+
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
         self.chenyme_enabled_var.trace_add("write", lambda *_: self._refresh_g2a_fields())
@@ -2531,6 +2540,8 @@ class GrokRegisterGUI:
             self.g2a_import_file_var.get().strip() or "exports/grok2api_build_import.json"
         )
         config["g2a_build_remote_import_enabled"] = bool(self.g2a_remote_enabled_var.get())
+        if hasattr(self, "sso_force_reconvert_var"):
+            config["sso_force_reconvert"] = bool(self.sso_force_reconvert_var.get())
 
     def log(self, message):
         if not should_emit_log(message):
@@ -2644,6 +2655,7 @@ class GrokRegisterGUI:
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
         config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        self._apply_g2a_config_from_ui()
         if not config["cpa_auth_dir"] and not config["cpa_remote_url"]:
             self.log("[!] 请先配置 CPA auth 目录或远程地址")
             return
@@ -2681,11 +2693,22 @@ class GrokRegisterGUI:
                         workers = int(config.get("register_workers", 1) or 1)
                     workers = max(1, min(workers, 8))
                     self.log(f"[补转] 并发分片 workers={workers}")
+                    g2a_file = None
+                    if config.get("g2a_build_import_file_enabled"):
+                        g2a_file = str(
+                            config.get("g2a_build_import_file")
+                            or "exports/grok2api_build_import.json"
+                        ).strip() or "exports/grok2api_build_import.json"
+                    force = bool(config.get("sso_force_reconvert", False))
+                    if force:
+                        self.log("[补转] ⚠ 强制重转：已有 CPA 也会重新换 token（请确认 SSO 仍有效）")
                     result = _s2cpa.convert_sso_entries(
                         entries,
                         cpa_auth_dir=config["cpa_auth_dir"] or None,
                         cpa_remote_url=config["cpa_remote_url"] or None,
                         cpa_management_key=config["cpa_management_key"] or None,
+                        g2a_build_import_file=g2a_file,
+                        force_reconvert=force,
                         proxy=config["proxy"],
                         workers=workers,
                         log=lambda message: self.log(f"[补转] {str(message).strip()}"),

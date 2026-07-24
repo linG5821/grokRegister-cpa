@@ -992,6 +992,7 @@ def convert_sso_entries(
     cpa_remote_url: str | None = None,
     cpa_management_key: str | None = None,
     g2a_build_import_file: str | None = None,
+    force_reconvert: bool = False,
     proxy: str = "",
     delay: int = 0,
     fallback_email: str = "",
@@ -999,12 +1000,16 @@ def convert_sso_entries(
     log=print,
     should_stop=None,
 ) -> dict:
+    force = bool(force_reconvert)
     local_emails = collect_existing_auth_emails(
         out=out,
         out_dir=out_dir,
         cpa_auth_dir=cpa_auth_dir,
     )
-    if cpa_remote_url:
+    if force:
+        # 强制重转：不按已有 CPA 跳过（用于 token 全过期时全量换新）
+        existing_emails: set[str] = set()
+    elif cpa_remote_url:
         # 补转以远程 CPA 为准：本地 TXT 提供候选，远程缺失才转换。
         # 本地已有 JSON 但远程缺失时仍需重转/上传，不能被本地文件跳过。
         existing_emails = collect_remote_auth_emails(
@@ -1020,8 +1025,13 @@ def convert_sso_entries(
     if workers > 1 and out and (merge or total > 1) and not out_dir and not cpa_auth_dir and not cpa_remote_url:
         workers = 1
 
-    log(f"🚀 SSO → auth.json: {total} 个, delay={delay}s, workers={workers}")
-    if existing_emails:
+    log(
+        f"🚀 SSO → auth.json: {total} 个, delay={delay}s, workers={workers}"
+        f"{', force_reconvert=ON' if force else ''}"
+    )
+    if force:
+        log("[*] 强制重转已开启：已有 CPA 账号也会重新 Device Flow 换 token")
+    elif existing_emails:
         log(f"[*] 已检索到已有账号: {len(existing_emails)} 个，重复账号将跳过")
 
     lock = threading.Lock()
@@ -1041,7 +1051,7 @@ def convert_sso_entries(
         email = (source_email or fallback_email or "").strip()
         email_key = email.casefold()
         with lock:
-            if email_key and email_key in existing_emails:
+            if (not force) and email_key and email_key in existing_emails:
                 stats["skipped"] += 1
                 already = True
             else:
