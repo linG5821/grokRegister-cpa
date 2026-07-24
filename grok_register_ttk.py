@@ -175,6 +175,11 @@ DEFAULT_CONFIG = {
     "g2a_build_remote_import_enabled": False,
     # 补转：强制重转已有 CPA 账号（token 过期时用；默认跳过已有）
     "sso_force_reconvert": False,
+    # SSO 失效重登（独立目录 + 可选再 Device Flow）
+    "sso_relogin_out_dir": "relogin_accounts",
+    "sso_relogin_only_dead": True,
+    "sso_relogin_auto_device_flow": True,
+    "sso_relogin_workers": 1,
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -2403,6 +2408,33 @@ class GrokRegisterGUI:
             variable=self.sso_force_reconvert_var,
         ).grid(row=6, column=0, columnspan=4, sticky=tk.W, pady=2)
 
+        self.sso_relogin_only_dead_var = tk.BooleanVar(
+            value=bool(config.get("sso_relogin_only_dead", True))
+        )
+        self.sso_relogin_auto_device_var = tk.BooleanVar(
+            value=bool(config.get("sso_relogin_auto_device_flow", True))
+        )
+        self.sso_relogin_out_dir_var = tk.StringVar(
+            value=str(config.get("sso_relogin_out_dir", "relogin_accounts") or "relogin_accounts")
+        )
+        tk_checkbutton(
+            self.g2a_frame,
+            text="重登：仅处理 SSO 探活失败的号（不勾选=全部尝试账密重登）",
+            variable=self.sso_relogin_only_dead_var,
+        ).grid(row=7, column=0, columnspan=4, sticky=tk.W, pady=2)
+        tk_checkbutton(
+            self.g2a_frame,
+            text="重登成功后自动 Device Flow（写 CPA + 本地 Build JSON）",
+            variable=self.sso_relogin_auto_device_var,
+        ).grid(row=8, column=0, columnspan=4, sticky=tk.W, pady=2)
+        g_label(9, 0, "重登输出目录:")
+        g_field(
+            tk_entry(self.g2a_frame, textvariable=self.sso_relogin_out_dir_var, width=40),
+            9,
+            1,
+            columnspan=3,
+        )
+
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
         self.chenyme_enabled_var.trace_add("write", lambda *_: self._refresh_g2a_fields())
@@ -2435,6 +2467,12 @@ class GrokRegisterGUI:
             command=self.start_sso_recovery,
         )
         self.sso_convert_btn.pack(side=tk.LEFT, padx=5)
+        self.sso_relogin_btn = tk_button(
+            btn_frame,
+            text="SSO失效重登",
+            command=self.start_sso_relogin,
+        )
+        self.sso_relogin_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
 
@@ -2542,6 +2580,12 @@ class GrokRegisterGUI:
         config["g2a_build_remote_import_enabled"] = bool(self.g2a_remote_enabled_var.get())
         if hasattr(self, "sso_force_reconvert_var"):
             config["sso_force_reconvert"] = bool(self.sso_force_reconvert_var.get())
+        if hasattr(self, "sso_relogin_only_dead_var"):
+            config["sso_relogin_only_dead"] = bool(self.sso_relogin_only_dead_var.get())
+            config["sso_relogin_auto_device_flow"] = bool(self.sso_relogin_auto_device_var.get())
+            config["sso_relogin_out_dir"] = (
+                self.sso_relogin_out_dir_var.get().strip() or "relogin_accounts"
+            )
 
     def log(self, message):
         if not should_emit_log(message):
@@ -2720,11 +2764,105 @@ class GrokRegisterGUI:
 
         threading.Thread(target=_job, daemon=True).start()
 
+    def start_sso_relogin(self):
+        """SSO 失效时账密重登；新 SSO 写入 relogin_accounts/，可选再 Device Flow。"""
+        if self.is_running:
+            self.log("[!] 注册任务正在运行，请结束后再重登")
+            return
+        if self.sso_convert_running:
+            self.log("[!] SSO 补转/重登任务已在运行")
+            return
+
+        config["proxy"] = self.proxy_var.get().strip()
+        config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
+        config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
+        config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        self._apply_g2a_config_from_ui()
+        save_config()
+
+        self.sso_convert_running = True
+        self.sso_convert_stop_requested = False
+        self.start_btn.config(state=tk.DISABLED)
+        self.sso_convert_btn.config(state=tk.DISABLED)
+        if hasattr(self, "sso_relogin_btn"):
+            self.sso_relogin_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.check_btn.config(state=tk.DISABLED)
+        self.status_var.set("SSO 重登中...")
+        self.status_label.config(foreground="blue")
+        out_dir = str(config.get("sso_relogin_out_dir") or "relogin_accounts")
+        self.log(f"[*] 开始 SSO 失效重登 → 输出目录 {out_dir}")
+
+        def _job():
+            result = None
+            error = ""
+            try:
+                import sso_relogin as _relogin
+
+                g2a_file = None
+                if config.get("g2a_build_import_file_enabled"):
+                    g2a_file = str(
+                        config.get("g2a_build_import_file")
+                        or "exports/grok2api_build_import.json"
+                    ).strip() or "exports/grok2api_build_import.json"
+                try:
+                    workers = int(config.get("sso_relogin_workers", 1) or 1)
+                except Exception:
+                    workers = 1
+                workers = max(1, min(workers, 4))
+                result = _relogin.run_sso_relogin(
+                    scan_dir=APP_DIR,
+                    out_dir=out_dir,
+                    only_dead=bool(config.get("sso_relogin_only_dead", True)),
+                    auto_device_flow=bool(config.get("sso_relogin_auto_device_flow", True)),
+                    cpa_auth_dir=config.get("cpa_auth_dir") or "",
+                    cpa_remote_url=config.get("cpa_remote_url") or "",
+                    cpa_management_key=config.get("cpa_management_key") or "",
+                    g2a_build_import_file=g2a_file,
+                    proxy=config.get("proxy") or "",
+                    workers=workers,
+                    headless=False,
+                    log=lambda m: self.log(f"[重登] {str(m).strip()}"),
+                    should_stop=lambda: self.sso_convert_stop_requested,
+                )
+            except Exception as exc:
+                error = str(exc)
+            self.ui_queue.put((self._on_sso_relogin_done, (result, error)))
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _on_sso_relogin_done(self, result, error):
+        self.sso_convert_running = False
+        self.sso_convert_stop_requested = False
+        self.start_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.sso_convert_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        if hasattr(self, "sso_relogin_btn"):
+            self.sso_relogin_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL if self.is_running else tk.DISABLED)
+        self.check_btn.config(state=tk.NORMAL)
+        if error:
+            self.log(f"[重登] [-] 任务异常: {error}")
+            self.status_var.set("SSO 重登失败")
+            self.status_label.config(foreground="red")
+            return
+        result = result or {}
+        self.log(
+            f"[重登] 完成: 成功 {result.get('ok', 0)} | 跳过(仍活) {result.get('skip_alive', 0)} | "
+            f"失败 {result.get('fail', 0)} | Device {result.get('device_ok', 0)} | "
+            f"目录 {result.get('out_dir', '')}"
+        )
+        if result.get("success_file"):
+            self.log(f"[重登] 成功文件: {result.get('success_file')}")
+        self.status_var.set("SSO 重登完成" if not result.get("stopped") else "SSO 重登已停止")
+        self.status_label.config(foreground="green" if int(result.get("ok") or 0) else "orange")
+
     def _on_sso_recovery_done(self, result, error):
         self.sso_convert_running = False
         self.sso_convert_stop_requested = False
         self.start_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
         self.sso_convert_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        if hasattr(self, "sso_relogin_btn"):
+            self.sso_relogin_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL if self.is_running else tk.DISABLED)
         self.check_btn.config(state=tk.NORMAL)
         if error:

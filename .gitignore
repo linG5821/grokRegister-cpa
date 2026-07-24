@@ -22,6 +22,8 @@ auth_out.json
 auth_out/
 exports/
 grok2api_build_import.json
+relogin_accounts/
+relogin_failed.txt
 auth_merged.json
 *.auth.json
 xai-*.json
